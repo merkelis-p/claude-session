@@ -1,0 +1,12 @@
+*.bak-*
+*.log
+.DS_Store
+sdd-workspace/
+
+# User data — must never be committed to this (public) repo.
+*.jsonl
+transfer-log.jsonl
+accounts.conf
+schedules/
+*.plist
+.env*

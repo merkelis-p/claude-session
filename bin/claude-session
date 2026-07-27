@@ -1,0 +1,1492 @@
+#!/usr/bin/env bash
+#
+# claude-session — launch/attach a Claude Code session in tmux, with state-aware
+# duplicate detection, multi-account support, and a rich `ls` / `doctor` view.
+#
+# Why tmux? The Claude process lives in tmux on this host so it survives SSH/
+# VSCode tunnel disconnects. Any client (laptop, phone Termius, browser tunnel)
+# can reattach to the same Claude. Inside Claude: /rc = phone Remote Control,
+# /ide = VSCode diff view.
+#
+# Usage:
+#   claude-session                 # project = current ~/<dir>; session <project>-claude
+#   claude-session <project>       # ~/<project>;               session <project>-claude
+#   claude-session <project> new   # next free <project>-claude-N (the iterator)
+#   claude-session <project> <N>   # specific <project>-claude-N
+#   claude-session new             # (from inside ~/<project>) next free numbered
+#   claude-session ls              # just list: numbered cards + chat titles (no picker)
+#   claude-session resume          # interactive picker: pick a chat to open/preview
+#   claude-session doctor          # find duplicates, stalls, dead session files,
+#                                  # orphaned dev processes (ppid=1), stuck builds
+#   claude-session doctor --reap [--force]  # kill orphaned dev processes found above
+#                                  # (confirms interactively; --force for unattended)
+#   claude-session kill            # interactive: pick session(s) to kill, shows RAM
+#   claude-session kill <session>  # tmux kill-session shortcut (direct)
+#
+#   claude-session accounts add <name> [description]  # register + interactive /login
+#   claude-session accounts ls                         # list registered accounts
+#   claude-session accounts rm <name>                  # unregister (keeps credentials on disk)
+#
+#   claude-session <native-claude-args>  # runs native claude: inline (exec) for
+#                                         # one-shot verbs like `update`/`mcp`,
+#                                         # tmux for interactive ones like `--resume`
+#   claude-session -- <args>              # forces native routing (use for name
+#                                         # clashes with our own verbs, e.g. `-- doctor`)
+#                                         # both honor --account=
+#
+#   claude-session transfer [sessionId] --to=<account> [--from=<account>]
+#                                       [--move] [--force] [--limit=N] [--launch]
+#     Move one chat's on-disk state between accounts. Omit sessionId to pick from
+#     a list of the source account's chats (every project, not just this dir;
+#     50 most recent by default, --limit=0 for all). Copies by default; --move
+#     removes the source afterwards. Pure data operation — never touches tmux.
+#     Retiring the old session is a separate, deliberate `claude-session kill`.
+#     --launch reopens the moved chat resumed in tmux under the destination account.
+#
+#   claude-session transfer log [--from=A --to=B --sid=S --since=DATE --limit=N]
+#                                                  # show the transfer history (ledger)
+#   claude-session transfer undo [sid|id]          # reverse the last (or named) transfer
+#   claude-session transfer redo <id>              # re-apply a logged transfer
+#   claude-session transfer prune <id>             # drop a ledger record (keeps chat data)
+#
+#   claude-session schedule add <prompt> (--chat=<sid>|--new)
+#     (--every=<dur>|--daily-at=<HH:MM>|--once="<YYYY-MM-DD HH:MM>")
+#     [--account=] [--mode=plan|autopilot] [--cwd=] [--timeout=]
+#                                          # schedule a prompt via a systemd user timer
+#   claude-session schedule ls|log <id>|rm <id>|run <id>
+#                                          # list/inspect/remove/fire a scheduled prompt
+#
+# Flags: --force / -f   override the "already RC-bridged" guard
+#                       (for `transfer`: allow overwriting at the destination)
+#        --to=NAME      transfer destination account (required by `transfer`)
+#        --from=NAME    transfer source account (default: default)
+#        --move         transfer removes the source copy instead of keeping it
+#        --limit=N      transfer picker: how many recent chats to list (0 = all)
+#        --plain / -p   force non-interactive (no picker even in `resume`)
+#        --reap         `doctor --reap`: kill orphaned dev processes (ppid=1)
+#                       found by doctor; needs a TTY confirm or --force
+#        --handoff=FILE read FILE as initial takeover context (any agent's handoff)
+#        --mode=MODE    interactive, plan, or autopilot (maps to --permission-mode)
+#        --account=NAME run under a registered account's isolated CLAUDE_CONFIG_DIR
+#                       (session becomes <project>-claude-NAME); omit for the
+#                       default account. See `claude-session accounts`.
+#
+# `ls` only prints the list. `resume` is the interactive launcher: numbered cards
+# show each chat's title; type a number to open it, p<number> to preview it (uses
+# fzf if present). `ls`/`doctor`/`resume`/`kill` cover every registered account —
+# cards are tagged [account] unless it's the default one.
+
+# Bash 4+ is required: `declare -A` (associative arrays) is used at top level, so
+# a 3.2 shell dies before any dispatch with an opaque "declare: -A: invalid option".
+if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
+  echo "claude-session: needs bash >= 4 (this is ${BASH_VERSION:-unknown})." >&2
+  echo "  macOS ships bash 3.2. Install a newer one:  brew install bash" >&2
+  echo "  then re-run — the shebang picks up the newer bash from PATH." >&2
+  exit 1
+fi
+
+VERSION="0.1.0"
+
+# Resolve our library directory from our own location, not from $HOME: the same
+# file must work from an install prefix (../share/claude-helpers) and from a repo
+# checkout (../lib), for any user. Minimal inline symlink resolution, because
+# compat.sh (which provides _readlink_f) is not sourced yet.
+_cs_self="${BASH_SOURCE[0]}"
+while [[ -L "$_cs_self" ]]; do
+  _cs_link="$(readlink "$_cs_self")"
+  [[ "$_cs_link" == /* ]] && _cs_self="$_cs_link" || _cs_self="$(dirname "$_cs_self")/$_cs_link"
+done
+_CS_BIN_DIR="$(cd "$(dirname "$_cs_self")" && pwd)"
+if [[ -z "${CLAUDE_HELPERS_LIB:-}" ]]; then
+  for _cand in "$_CS_BIN_DIR/../share/claude-helpers" "$_CS_BIN_DIR/../lib"; do
+    if [[ -f "$_cand/compat.sh" ]]; then CLAUDE_HELPERS_LIB="$(cd "$_cand" && pwd)"; break; fi
+  done
+fi
+if [[ -z "${CLAUDE_HELPERS_LIB:-}" || ! -f "$CLAUDE_HELPERS_LIB/compat.sh" ]]; then
+  echo "claude-session: cannot find its library directory." >&2
+  echo "  looked next to $_CS_BIN_DIR (../share/claude-helpers, ../lib)" >&2
+  echo "  set CLAUDE_HELPERS_LIB=/path/to/lib to override." >&2
+  exit 1
+fi
+
+set -euo pipefail
+
+. "$CLAUDE_HELPERS_LIB/compat.sh"
+. "$CLAUDE_HELPERS_LIB/ui.sh"
+. "$CLAUDE_HELPERS_LIB/titles.sh"
+. "$CLAUDE_HELPERS_LIB/ledger.sh"
+. "$CLAUDE_HELPERS_LIB/schedule.sh"
+
+# ---- account registry -------------------------------------------------------
+# ~/.config/claude-helpers/accounts.conf registers extra Claude Code accounts,
+# each isolated via its own CLAUDE_CONFIG_DIR. Same convention as services.conf:
+# bash-sourced, one `account` call per line, re-read every invocation. The
+# built-in "default" account (plain ~/.claude) always exists and is never in
+# this file.
+ACCOUNTS_CONF="$HOME/.config/claude-helpers/accounts.conf"
+declare -A ACCT_DIR ACCT_DESC
+ACCT_NAMES=()
+
+# Called by accounts.conf for each registered account.
+account() {
+  local name="$1" dir="${2/#\~/$HOME}" desc="${3:-}"
+  if [[ -z "$name" || "$name" == "default" || ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "claude-session: ignoring invalid account entry in $ACCOUNTS_CONF: '$name'" >&2
+    return
+  fi
+  ACCT_NAMES+=("$name")
+  ACCT_DIR[$name]="$dir"
+  ACCT_DESC[$name]="$desc"
+}
+
+if [[ -f "$ACCOUNTS_CONF" ]]; then
+  # shellcheck source=/dev/null
+  . "$ACCOUNTS_CONF"
+fi
+
+# Resolve an --account= name to its CLAUDE_CONFIG_DIR override.
+# Prints "" for empty/"default" (meaning: don't set CLAUDE_CONFIG_DIR at all).
+# Returns 1 for an unrecognized name.
+_account_config_dir() {
+  local name="$1" n
+  [[ -z "$name" || "$name" == "default" ]] && { printf ''; return 0; }
+  for n in "${ACCT_NAMES[@]+"${ACCT_NAMES[@]}"}"; do
+    [[ "$n" == "$name" ]] && { printf '%s' "${ACCT_DIR[$name]}"; return 0; }
+  done
+  return 1
+}
+
+# Account name -> its actual on-disk config dir, never empty ("default" -> ~/.claude).
+# Used by the data layer (ls/doctor/resume), which always needs a concrete path.
+_account_dir_or_default() {
+  local name="${1:-default}"
+  if [[ -z "$name" || "$name" == "default" ]]; then
+    printf '%s' "$HOME/.claude"
+  else
+    printf '%s' "${ACCT_DIR[$name]:-$HOME/.claude}"
+  fi
+}
+
+# name<TAB>config-dir for every account: synthetic "default" row first, then
+# every registered account. Used to merge sessions across all accounts.
+_all_accounts() {
+  printf 'default\t%s\n' "$HOME/.claude"
+  local n
+  for n in "${ACCT_NAMES[@]+"${ACCT_NAMES[@]}"}"; do
+    printf '%s\t%s\n' "$n" "${ACCT_DIR[$n]}"
+  done
+}
+
+# ---- session model ---------------------------------------------------------
+# Emit one TSV row per session file, across every registered account:
+#   tmux  pid  cwd  entry  status  sessionId  bridgeId  updatedMs  alive  account
+_session_rows() {
+  shopt -s nullglob
+  local acct_name acct_dir
+  while IFS=$'\t' read -r acct_name acct_dir; do
+    local f
+    for f in "$acct_dir/sessions"/*.json; do
+      local pid cwd entry status sid bid waitfor updated alive sess
+      pid="$(jq -r '.pid // empty' "$f" 2>/dev/null || true)"
+      [[ -z "$pid" ]] && continue
+      cwd="$(jq -r '.cwd // "-"' "$f")"
+      entry="$(jq -r '.entrypoint // "-"' "$f")"
+      status="$(jq -r '.status // "-"' "$f")"
+      waitfor="$(jq -r '.waitingFor // empty' "$f")"
+      [[ "$status" == "waiting" && -n "$waitfor" ]] && status="waiting:$waitfor"
+      # Default to "-" so consecutive tabs don't collapse in downstream `read`.
+      sid="$(jq -r '.sessionId // "-"' "$f")"
+      bid="$(jq -r '.bridgeSessionId // "-"' "$f")"
+      [[ -z "$sid" ]] && sid="-"
+      [[ -z "$bid" ]] && bid="-"
+      updated="$(jq -r '.statusUpdatedAt // .updatedAt // .startedAt // 0' "$f")"
+      if _proc_alive "$pid"; then alive=1; else alive=0; fi
+      sess="$(owner_tmux "$pid")"
+      [[ -z "$sess" && "$entry" == "claude-vscode" ]] && sess="(vscode)"
+      [[ -z "$sess" ]] && sess="(detached)"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$sess" "$pid" "$cwd" "$entry" "$status" "$sid" "$bid" "$updated" "$alive" "$acct_name"
+    done
+  done < <(_all_accounts)
+}
+
+# ---- enter / transcript helpers -------------------------------------------
+# Enter a session. Inside tmux, `attach` is refused (no nesting) and would dump
+# us back to the shell with the target left detached; switch-client moves the
+# current client instead, so this works from anywhere.
+_enter_session() {
+  if [[ -n "${TMUX:-}" ]]; then
+    echo "claude-session: inside tmux — switching client to '$1'" >&2
+    exec tmux switch-client -t "$1"
+  fi
+  exec tmux attach -t "$1"
+}
+
+
+
+
+
+
+# PID -> current RSS in MB (returns 0 if process is gone).
+_pid_ram_mb() {
+  local rss
+  rss="$(ps -p "$1" -o rss= 2>/dev/null | tr -d ' ')"
+  [[ -z "$rss" ]] && echo 0 || awk -v r="$rss" 'BEGIN{printf "%.0f", r/1024}'
+}
+
+# ---- orphan process detection ----------------------------------------------
+# A host once CPU-limited this box because 8 orphaned `medusa plugin:build`
+# processes and 6 `npm run dev` trees kept spinning for hours: their parent
+# tmux/claude session got killed, but children are NOT killed with the parent
+# — they get reparented to init (ppid=1) and never stop on their own. None of
+# this is visible in the Claude session-state JSON files _session_rows reads,
+# so it needs its own OS-process scan, independent of any Claude session.
+#
+# Dev-runner command patterns and the protected (never-touch) daemon comm
+# list. Protected is intentionally prefix-matched and generous: e.g. tmux's
+# own server process renames itself "tmux: server" (a literal embedded space
+# in its comm field), which our naive whitespace field-split below will
+# split into comm="tmux:" + args="server ...". Prefix matching still catches
+# it. Never risk a system daemon.
+_ORPHAN_DEV_PATTERN='node|npm|npx|tsx|esbuild|vite|next|medusa|plugin:build|nodemon|webpack'
+_ORPHAN_PROTECTED_PATTERN='^(tmux|claude|sshd|postgres|dockerd|containerd|systemd|earlyoom|ttyd|cloudflared|code|node_exporter)'
+
+# Raw process snapshot, reformatted to TSV: pid<TAB>ppid<TAB>etimes<TAB>pcpu<TAB>comm<TAB>args
+# Reads $ORPHAN_PS_SRC (a file, real ps field order) when set — so tests are
+# fully deterministic and never touch the real process table. Otherwise runs
+# real `ps` with the exact field layout this parsing depends on.
+_ps_snapshot_rows() {
+  if [[ -n "${ORPHAN_PS_SRC:-}" ]]; then
+    local src; src="$(cat "$ORPHAN_PS_SRC" 2>/dev/null || true)"
+    [[ -z "$src" ]] && return 0
+    awk '{
+      pid=$1; ppid=$2; etimes=$3; pcpu=$4; comm=$5
+      args=""
+      for (i=6;i<=NF;i++) args = args (i>6?" ":"") $i
+      printf "%s\t%s\t%s\t%s\t%s\t%s\n", pid, ppid, etimes, pcpu, comm, args
+    }' <<<"$src"
+    return 0
+  fi
+  # Real process table, via the portability shim (compat.sh): _proc_table emits
+  # the identical 6-field TSV (pid, ppid, elapsed-seconds, pcpu, comm, args) —
+  # `ps -o etime=` (parsed to seconds) in place of the Linux-only `ps -eo
+  # etimes=` field, and `ps -o comm= -p <pid>` (portable on both platforms) in
+  # place of reading the per-pid comm file that only exists under Linux's
+  # /proc, with the same comm-can-contain-spaces handling either way. No
+  # downstream change needed: _orphan_rows/_stuck_build_rows/_orphan_activity
+  # only ever consume this TSV.
+  _proc_table
+}
+
+# One TSV row per orphaned dev process: pid<TAB>etimes<TAB>pcpu<TAB>comm<TAB>args
+# Orphan = ppid==1, owned by us, older than 300s, matches a dev-runner pattern
+# (or is an orphaned Claude shell-snapshot wrapper), and isn't a protected
+# daemon. The real `ps -e -u` combo is a union (not an intersection) on this
+# box's procps, so `-u` alone doesn't actually filter by owner — we re-verify
+# ownership ourselves via _proc_owner_uid when running against the real
+# process table (skipped for $ORPHAN_PS_SRC fixtures, which have no real pids
+# to query).
+_orphan_rows() {
+  local rows; rows="$(_ps_snapshot_rows || true)"
+  [[ -z "$rows" ]] && return 0
+
+  local check_owner=1
+  [[ -n "${ORPHAN_PS_SRC:-}" ]] && check_owner=0
+  local my_uid; my_uid="$(id -u)"
+
+  local pid ppid etimes pcpu comm args
+  while IFS=$'\t' read -r pid ppid etimes pcpu comm args; do
+    [[ -z "$pid" ]] && continue
+    [[ "$ppid" == "1" ]] || continue
+    [[ "$etimes" =~ ^[0-9]+$ ]] || continue
+    (( etimes > 300 )) || continue
+    [[ "$comm" =~ $_ORPHAN_PROTECTED_PATTERN ]] && continue
+    if ! [[ "$args" =~ $_ORPHAN_DEV_PATTERN ]] && [[ "$args" != *shell-snapshots* ]]; then
+      continue
+    fi
+    if (( check_owner )); then
+      local owner_uid
+      if owner_uid="$(_proc_owner_uid "$pid")" && [[ -n "$owner_uid" ]]; then
+        [[ "$owner_uid" != "$my_uid" ]] && continue
+      else
+        # Cannot establish ownership -> do NOT claim this process is ours.
+        continue
+      fi
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$etimes" "$pcpu" "$comm" "$args"
+  done <<<"$rows"
+}
+
+# One TSV row per process whose args match a *:build subcommand and has been
+# running > 600s — regardless of parentage. A plugin/package build takes
+# seconds; one running 10+ minutes is hung, whether or not its parent is
+# still alive. Same TSV shape as _orphan_rows.
+_stuck_build_rows() {
+  local rows; rows="$(_ps_snapshot_rows || true)"
+  [[ -z "$rows" ]] && return 0
+
+  local pid ppid etimes pcpu comm args
+  while IFS=$'\t' read -r pid ppid etimes pcpu comm args; do
+    [[ -z "$pid" ]] && continue
+    [[ "$etimes" =~ ^[0-9]+$ ]] || continue
+    (( etimes > 600 )) || continue
+    [[ "$args" == *:build* ]] || continue
+    printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$etimes" "$pcpu" "$comm" "$args"
+  done <<<"$rows"
+}
+
+# etimes (seconds) -> human age: "5h04m" or, under an hour, "12m".
+_fmt_age_hm() {
+  local secs="${1:-0}" h m
+  h=$(( secs / 3600 ))
+  m=$(( (secs % 3600) / 60 ))
+  if (( h > 0 )); then printf '%dh%02dm' "$h" "$m"; else printf '%dm' "$m"; fi
+}
+
+# Friendly two-token label from a full args string, e.g. turns
+# "node /path/node_modules/.bin/medusa plugin:build" into "medusa plugin:build":
+# basename the last two whitespace-separated tokens (drop interpreter/path noise).
+_short_cmd() {
+  local args="$1"
+  [[ -z "$args" ]] && { printf '(unknown)'; return; }
+  # Claude shell-snapshot wrappers bury their real command behind a long
+  # source+redirect line; name them for what they are instead.
+  [[ "$args" == *shell-snapshots* ]] && { printf 'claude shell wrapper'; return; }
+  # Identify a process by the HEAD of its command (interpreter, script,
+  # subcommand), basenamed — not the tail, which is usually a redirect target
+  # or a bare argument ("npm run dev" must not render as "run dev").
+  local -a toks; read -ra toks <<<"$args"
+  local out="" tok kept=0
+  for tok in ${toks[@]+"${toks[@]}"}; do
+    case "$tok" in '>'*|'<'*|'2>'*|'&'*'|'*|'|'*) break ;; esac
+    [[ "$tok" == -* ]] && continue          # skip flags, keep subcommands
+    out="${out:+$out }${tok##*/}"
+    kept=$((kept+1)); (( kept >= 3 )) && break
+  done
+  printf '%s' "${out:-$args}"
+}
+
+# Command patterns that mark a process as legitimately long-running work whose
+# loss would destroy something real: an agent run, a test suite, a build.
+# Checked by _orphan_activity IN ADDITION to a raw CPU-busy threshold, because
+# some real work reads near-0% CPU on any given sample (an agent waiting on a
+# model response, `rsync` between bursts) yet is still work in progress.
+#
+# Split in two on purpose, both anchored/whole-token — NOT a bare substring
+# search — after live testing on this box caught the obvious trap: an orphaned
+# `claude` shell-snapshot wrapper always has "claude" somewhere in its own
+# args (its snapshot path is literally .../.claude*/shell-snapshots/...), so
+# an unanchored `=~ claude` would call EVERY claude-wrapper orphan "active"
+# regardless of whether anything real is running underneath — defeating the
+# whole point of this check for its single most common target. Single-word
+# patterns are matched against a whole token (or `comm`) only; multi-word
+# phrases are specific enough to substring-match safely.
+_ORPHAN_ACTIVE_TOKEN_PATTERN='^(codex|claude|aider|pytest|ffmpeg|rsync|jest|vitest|tsc|webpack|cargo|gradle|mvn)$'
+_ORPHAN_ACTIVE_PHRASE_PATTERN='docker build|npm test|npm run build'
+
+# Classify an orphan's full descendant subtree (the orphan pid itself, plus
+# every process reparented under it) as "active" or "idle". Prints
+# "active<TAB><reason>" on stdout, or "idle".
+#
+# WHY this exists: `doctor` flags a pid as an orphan by looking only at ITS
+# OWN ppid/CPU — but the orphan is frequently just a shell wrapper sitting at
+# 0.0% CPU with a real, busy job running several levels down (e.g. a `claude`
+# shell wrapper -> `bash run.sh` -> `codex exec`, actively writing logs).
+# `--reap` kills the whole subtree (_pid_descendants), so judging only the
+# root pid would silently destroy that job. This walks the whole subtree
+# instead.
+#
+# Reads the SAME process source as everything else (_ps_snapshot_rows), so it
+# honors $ORPHAN_PS_SRC in tests and never reads /proc directly itself.
+#
+# Deliberately conservative, on purpose: a false "active" only costs a
+# skipped reap (the process spins a little longer — harmless); a false "idle"
+# destroys real work. When genuinely in doubt, this calls it active.
+_orphan_activity() {
+  local root="$1"
+  local rows; rows="$(_ps_snapshot_rows || true)"
+  [[ -z "$rows" ]] && { printf 'idle'; return 0; }
+
+  local -A _oa_children _oa_pcpu _oa_args _oa_comm
+  local pid ppid etimes pcpu comm args
+  while IFS=$'\t' read -r pid ppid etimes pcpu comm args; do
+    [[ -z "$pid" ]] && continue
+    _oa_children[$ppid]+=" $pid"
+    _oa_pcpu[$pid]="$pcpu"
+    _oa_args[$pid]="$args"
+    _oa_comm[$pid]="$comm"
+  done <<<"$rows"
+
+  local -a queue=("$root") subtree=()
+  local qi=0
+  while (( qi < ${#queue[@]} )); do
+    local cur="${queue[$qi]}"; qi=$((qi+1))
+    subtree+=("$cur")
+    local k
+    for k in ${_oa_children[$cur]:-}; do queue+=("$k"); done
+  done
+
+  local p
+  for p in "${subtree[@]}"; do
+    local pc="${_oa_pcpu[$p]:-0}"
+    if awk -v v="$pc" 'BEGIN{ if (v+0>=0.5) exit 0; exit 1 }' 2>/dev/null; then
+      printf 'active\t%s (%s%% CPU)' "$(_short_cmd "${_oa_args[$p]:-}")" "$pc"
+      return 0
+    fi
+  done
+  for p in "${subtree[@]}"; do
+    local ar="${_oa_args[$p]:-}" cm="${_oa_comm[$p]:-}"
+    if [[ "$cm" =~ $_ORPHAN_ACTIVE_TOKEN_PATTERN ]] || [[ "$ar" =~ $_ORPHAN_ACTIVE_PHRASE_PATTERN ]]; then
+      printf 'active\t%s (long-running job)' "$(_short_cmd "$ar")"
+      return 0
+    fi
+    local -a _oa_toks; read -ra _oa_toks <<<"$ar"
+    local t tb
+    for t in ${_oa_toks[@]+"${_oa_toks[@]}"}; do
+      tb="${t##*/}"
+      if [[ "$tb" =~ $_ORPHAN_ACTIVE_TOKEN_PATTERN ]]; then
+        printf 'active\t%s (long-running job)' "$(_short_cmd "$ar")"
+        return 0
+      fi
+    done
+  done
+  printf 'idle'
+}
+
+# ---- doctor checks ---------------------------------------------------------
+# Return value: array of warning lines, plus an exit-code summary.
+# Stdout = warnings (one per line, possibly colored); returns count via $?
+_doctor_warnings() {
+  local rows; rows="$(_session_rows || true)"
+  local n=0
+
+  # Checks (1)-(5) inspect Claude session-state JSON files, so they need at
+  # least one live/known session to say anything. Checks (6)-(7) scan the OS
+  # process table directly and must run even with zero Claude sessions —
+  # that's exactly the state a box is in after the incident this guards
+  # against: every claude/tmux parent is long gone, only orphaned children
+  # (and possibly hung builds) remain.
+  if [[ -n "$rows" ]]; then
+
+  # (1) Two PIDs with the SAME sessionId  — true "exact same chat opened twice".
+  while IFS=$'\t' read -r sid pids; do
+    [[ -z "$sid" || "$sid" == "-" ]] && continue
+    local count; count="$(awk -F: '{print NF}' <<<"$pids")"
+    if (( count > 1 )); then
+      printf '%b same chat %s open in %d procs: %s\n' \
+        "$GLYPH_ALERT" "$(truncate_str "$sid" 18)" "$count" "$(truncate_str "$pids" 40)"
+      n=$((n+1))
+    fi
+  done < <(awk -F '\t' '$6!="-" && $6!="" { a[$6] = (a[$6] ? a[$6]":" : "") $2 } END { for (k in a) print k"\t"a[k] }' <<<"$rows")
+
+  # (2) Two PIDs with the SAME bridgeSessionId — Remote Control bridge held by two procs.
+  while IFS=$'\t' read -r bid pids; do
+    [[ -z "$bid" || "$bid" == "-" ]] && continue
+    local count; count="$(awk -F: '{print NF}' <<<"$pids")"
+    if (( count > 1 )); then
+      printf '%b RC bridge %s held by %d procs: %s\n' \
+        "$GLYPH_ALERT" "$(truncate_str "$bid" 18)" "$count" "$(truncate_str "$pids" 40)"
+      n=$((n+1))
+    fi
+  done < <(awk -F '\t' '$7!="-" && $7!="" { a[$7] = (a[$7] ? a[$7]":" : "") $2 } END { for (k in a) print k"\t"a[k] }' <<<"$rows")
+
+  # (3) Multiple PIDs for same (cwd, account) but only some bridged — duplicate-RC
+  # pattern. Different accounts sharing a cwd are excluded on purpose (see the
+  # per-(cwd,account) dup-guard in the launch path).
+  while IFS=$'\t' read -r key group; do
+    local dup_cwd="${key%%#*}" dup_acct="${key#*#}"
+    local total bridged
+    total="$(awk -F: '{print NF}' <<<"$group")"
+    bridged="$(awk -F: '{n=0; for(i=1;i<=NF;i++) if($i ~ /\|OK/) n++; print n}' <<<"$group")"
+    if (( total > 1 )); then
+      if (( bridged >= 1 && bridged < total )); then
+        local acct_tag=""
+        [[ "$dup_acct" != "default" ]] && acct_tag=" [$dup_acct]"
+        printf '%b %s%s: %d procs, %d bridged — others mirror text, no approvals\n' \
+          "$GLYPH_ALERT" "$(short_home "$dup_cwd")" "$acct_tag" "$total" "$bridged"
+        printf '    PIDs: %s\n' "$(truncate_str "$group" 60)"
+        n=$((n+1))
+      fi
+    fi
+  done < <(awk -F '\t' '{mark=($7!="-" && $7!="")?"|OK":""; printf "%s#%s\t%s%s\n",$3,$10,$2,mark}' <<<"$rows" \
+           | awk -F '\t' '{ a[$1] = (a[$1] ? a[$1]":" : "") $2 } END { for (k in a) print k"\t"a[k] }')
+
+  # (4) "Waiting" stalled > 5 minutes — phone approval was likely lost.
+  while IFS=$'\t' read -r pid cwd status updated_ms alive; do
+    [[ "$alive" != "1" ]] && continue
+    [[ "$status" != waiting* ]] && continue
+    local secs=$(( updated_ms / 1000 ))
+    local age=$(( $(date +%s) - secs ))
+    if (( age >= 300 )); then
+      printf '%b pid %s (%s) stuck "%s" %s — phone approval lost\n' \
+        "$GLYPH_ALERT" "$pid" "$(short_home "$cwd")" "$(truncate_str "$status" 18)" "$(ms_relative "$updated_ms")"
+      n=$((n+1))
+    fi
+  done < <(awk -F '\t' '{print $2"\t"$3"\t"$5"\t"$8"\t"$9}' <<<"$rows")
+
+  # (5) Stale session files (PID gone).
+  while IFS=$'\t' read -r pid cwd alive account; do
+    if [[ "$alive" == "0" ]]; then
+      local stale_sdir; stale_sdir="$(_account_dir_or_default "$account")/sessions"
+      printf '%b stale: %s/%s.json (pid gone, %s)\n' \
+        "$GLYPH_DASH" "$(short_home "$stale_sdir")" "$pid" "$(short_home "$cwd")"
+      n=$((n+1))
+    fi
+  done < <(awk -F '\t' '{print $2"\t"$3"\t"$9"\t"$10}' <<<"$rows")
+
+  fi # [[ -n "$rows" ]]
+
+  # (6) Orphaned dev processes (ppid=1) — parents died, children were
+  # reparented to init and spin forever (the exact failure mode that
+  # CPU-limited this box: 8 orphaned `medusa plugin:build` + 6 abandoned
+  # `npm run dev` trees, invisible to checks (1)-(5)).
+  #
+  # An orphan itself can read 0.0% CPU while a descendant several levels down
+  # is doing real work (a `claude` shell wrapper -> `bash run.sh` -> `codex
+  # exec`, actively writing logs) — reap kills the whole subtree, so each
+  # orphan is classified via _orphan_activity BEFORE anything is shown, and
+  # the summary + per-line markers reflect what --reap would actually be safe
+  # to touch.
+  local orphan_rows; orphan_rows="$(_orphan_rows || true)"
+  if [[ -n "$orphan_rows" ]]; then
+    local orphan_count total_cpu
+    orphan_count="$(wc -l <<<"$orphan_rows")"
+    total_cpu="$(awk -F'\t' '{sum+=$3} END{printf "%.1f", sum+0}' <<<"$orphan_rows")"
+
+    local reapable_count=0 busy_count=0
+    local -A _oa_status _oa_reason
+    local pid etimes pcpu comm args act
+    while IFS=$'\t' read -r pid etimes pcpu comm args; do
+      [[ -z "$pid" ]] && continue
+      act="$(_orphan_activity "$pid")"
+      if [[ "$act" == active$'\t'* ]]; then
+        _oa_status[$pid]="active"
+        _oa_reason[$pid]="${act#active$'\t'}"
+        busy_count=$((busy_count+1))
+      else
+        _oa_status[$pid]="idle"
+        reapable_count=$((reapable_count+1))
+      fi
+    done <<<"$orphan_rows"
+
+    printf '%b %d orphaned dev process(es) (ppid=1), %s%% CPU total — %d reapable, %d busy (parents died)\n' \
+      "$GLYPH_ALERT" "$orphan_count" "$total_cpu" "$reapable_count" "$busy_count"
+    local shown=0
+    while IFS=$'\t' read -r pid etimes pcpu comm args; do
+      (( shown >= 5 )) && continue
+      shown=$((shown+1))
+      local marker=""
+      [[ "${_oa_status[$pid]:-idle}" == "idle" ]] && marker="  [reapable]"
+      printf '    pid %s  %s  %s%%  %s%s\n' \
+        "$pid" "$(_fmt_age_hm "$etimes")" "$pcpu" "$(truncate_str "$(_short_cmd "$args")" 50)" "$marker"
+      if [[ "${_oa_status[$pid]:-idle}" == "active" ]]; then
+        printf '        ↳ active: %s — reap will skip it\n' "${_oa_reason[$pid]}"
+      fi
+    done <<<"$orphan_rows"
+    if (( orphan_count > 5 )); then
+      printf '    … and %d more\n' "$(( orphan_count - 5 ))"
+    fi
+    printf '    → reap them: claude-session doctor --reap\n'
+    n=$((n+1))
+  fi
+
+  # (7) Stuck builds (*:build), regardless of parentage — a plugin/package
+  # build takes seconds; one running 10+ minutes is hung.
+  local stuck_rows; stuck_rows="$(_stuck_build_rows || true)"
+  if [[ -n "$stuck_rows" ]]; then
+    local stuck_count oldest
+    stuck_count="$(wc -l <<<"$stuck_rows")"
+    oldest="$(awk -F'\t' 'BEGIN{m=0} {if($2+0>m) m=$2+0} END{print m}' <<<"$stuck_rows")"
+    printf '%b %d stuck build process(es) — *:build running >10m (oldest %s) — a build this long is hung\n' \
+      "$GLYPH_ALERT" "$stuck_count" "$(_fmt_age_hm "$oldest")"
+    n=$((n+1))
+  fi
+
+  return "$n"
+}
+
+# Per-pid: does it have any warning? Lightweight check used by `ls` to mark cards.
+declare -A PID_FLAG_TEXT
+
+_compute_pid_flags() {
+  local rows; rows="$(_session_rows || true)"
+  [[ -z "$rows" ]] && return
+
+  # (cwd, account) dup-only-some-bridged → flag all non-bridged PIDs in that
+  # group as "duplicate". Different accounts in the same cwd are independent
+  # RC bridges, not a conflict, so the grouping key includes account (field 10).
+  declare -A CWD_TOTAL CWD_BRIDGED
+  while IFS=$'\t' read -r pid key bid; do
+    CWD_TOTAL[$key]=$(( ${CWD_TOTAL[$key]:-0} + 1 ))
+    [[ "$bid" != "-" && -n "$bid" ]] && CWD_BRIDGED[$key]=$(( ${CWD_BRIDGED[$key]:-0} + 1 ))
+  done < <(awk -F '\t' '$9=="1" {print $2"\t"$3"#"$10"\t"$7}' <<<"$rows")
+
+  while IFS=$'\t' read -r pid key bid sid status updated_ms alive; do
+    [[ "$alive" != "1" ]] && { PID_FLAG_TEXT[$pid]="${R}stale${N}"; continue; }
+    local f=""
+    local total="${CWD_TOTAL[$key]:-0}" bridged="${CWD_BRIDGED[$key]:-0}"
+    if (( total > 1 && bridged >= 1 && bridged < total )) && [[ "$bid" == "-" || -z "$bid" ]]; then
+      f="${Y}duplicate${N}"
+    fi
+    if [[ "$status" == waiting* ]]; then
+      local secs
+      local age
+      secs=$(( updated_ms / 1000 ))
+      age=$(( $(date +%s) - secs ))
+      if (( age >= 300 )); then
+        [[ -n "$f" ]] && f+=" "
+        f+="${Y}stalled${N}"
+      fi
+    fi
+    PID_FLAG_TEXT[$pid]="$f"
+  done < <(awk -F '\t' '{print $2"\t"$3"#"$10"\t"$7"\t"$6"\t"$5"\t"$8"\t"$9}' <<<"$rows")
+}
+
+# ---- ls --------------------------------------------------------------------
+# Index -> session maps, populated by cmd_ls and consumed by the picker.
+declare -a IDX_SESS IDX_PID IDX_CWD IDX_SID IDX_ACCOUNT
+LS_COUNT=0   # number of cards rendered by the last cmd_ls (consumed by resume)
+
+cmd_ls() {
+  LS_COUNT=0
+  local rows; rows="$(_session_rows || true)"
+  if [[ -z "$rows" ]]; then
+    box_top "Claude sessions"
+    box_line "$(printf '%bno active Claude processes%b' "$DIM" "$N")"
+    # Show tmux sessions whose Claude has exited
+    local stale
+    stale="$(tmux ls 2>/dev/null | grep -E -- '-claude' || true)"
+    if [[ -n "$stale" ]]; then
+      box_blank
+      box_line "$(printf '%btmux sessions where claude exited:%b' "$DIM" "$N")"
+      while IFS= read -r line; do box_line "  $line"; done <<<"$stale"
+    fi
+    box_bottom
+    return
+  fi
+
+  _compute_pid_flags
+  _ledger_provenance_load
+
+  box_top "Claude sessions"
+  local first=1 i=0
+  while IFS=$'\t' read -r sess pid cwd entry status sid bid updated_ms alive account; do
+    if (( !first )); then box_blank; fi
+    first=0
+    i=$((i+1))
+    IDX_SESS[$i]="$sess"; IDX_PID[$i]="$pid"; IDX_CWD[$i]="$cwd"; IDX_SID[$i]="$sid"; IDX_ACCOUNT[$i]="$account"
+
+    local glyph="$GLYPH_OK"
+    [[ "$alive" != "1" ]] && glyph="$GLYPH_FAIL"
+    local flag="${PID_FLAG_TEXT[$pid]:-}"
+    [[ -n "$flag" ]] && glyph="$GLYPH_WARN"
+
+    # line 1: [N] glyph SESSION  pid PID  RAM  CWD  [account]
+    local proj; proj="$(short_home "$cwd")"
+    local ram_mb; ram_mb="$(_pid_ram_mb "$pid")"
+    local ram_col="$N"
+    (( ram_mb > 800 )) && ram_col="$R" || { (( ram_mb > 400 )) && ram_col="$Y"; }
+    local acct_tag=""
+    [[ "$account" != "default" ]] && acct_tag="$(printf '  %b[%s]%b' "$M" "$account" "$N")"
+    box_line "$(printf '%b[%d]%b %b %b%s%b  %bpid%b %s  %b%sMB%b  %b%s%b%s' \
+      "$BOLD" "$i" "$N" "$glyph" "$BOLD" "$sess" "$N" "$DIM" "$N" "$pid" "$ram_col" "$ram_mb" "$N" "$C" "$proj" "$N" "$acct_tag")"
+
+    # line 2: chat title (the human name of the conversation), badged if it
+    # arrived here via `transfer` (ledger-backed provenance, not a guess).
+    local badge; badge="$(_transfer_badge "$sid" "$account")"
+    local tmax=62; [[ -n "$badge" ]] && tmax=44
+    local btxt=""; [[ -n "$badge" ]] && btxt="$(printf '   %b%s%b' "$DIM" "$badge" "$N")"
+    box_line "$(printf '    %b%s%b%s' "$Y" "$(truncate_str "$(_title_for_sid "$sid" "$cwd" "$(_account_dir_or_default "$account")")" "$tmax")" "$N" "$btxt")"
+
+    # line 3: entry/status/RC
+    local rc_disp
+    if [[ "$bid" != "-" && -n "$bid" ]]; then
+      rc_disp="$(printf '%b %s' "$GLYPH_CHECK" "$(truncate_str "${bid#session_}" 18)")"
+    else
+      rc_disp="$GLYPH_DASH"
+    fi
+    box_line "$(printf '  %bentry%b %-13s %bstatus%b %-26s %bRC%b %s' \
+      "$DIM" "$N" "$entry" \
+      "$DIM" "$N" "$(truncate_str "$status" 26)" \
+      "$DIM" "$N" "$rc_disp")"
+
+    # line 4 (only if there's something interesting): updated + flags
+    local extra=""
+    extra+="$(printf '%bupdated%b %s' "$DIM" "$N" "$(ms_relative "$updated_ms")")"
+    [[ -n "$flag" ]] && extra+="  ${GLYPH_ALERT} ${flag}"
+    box_line "  $extra"
+  done <<<"$rows"
+  box_bottom
+  LS_COUNT="$i"
+
+  # Warnings summary (compact)
+  local warn_count
+  warn_count="$(_doctor_warnings | wc -l || true)"
+  if (( warn_count > 0 )); then
+    printf '%b %d warning(s) — run: %bclaude-session doctor%b\n' \
+      "$GLYPH_ALERT" "$warn_count" "$BOLD" "$N"
+  fi
+}
+
+# ---- resume ----------------------------------------------------------------
+# Populate the IDX_* maps WITHOUT printing — the picker (fzf or _menu_loop) shows
+# its own list, so pre-listing here just scrolls away behind fzf's full-screen UI.
+_build_index() {
+  IDX_SESS=(); IDX_PID=(); IDX_CWD=(); IDX_SID=(); IDX_ACCOUNT=(); LS_COUNT=0
+  local rows; rows="$(_session_rows || true)"
+  _ledger_provenance_load
+  [[ -z "$rows" ]] && return
+  local i=0
+  while IFS=$'\t' read -r sess pid cwd entry status sid bid updated_ms alive account; do
+    i=$((i+1))
+    IDX_SESS[$i]="$sess"; IDX_PID[$i]="$pid"; IDX_CWD[$i]="$cwd"; IDX_SID[$i]="$sid"; IDX_ACCOUNT[$i]="$account"
+  done <<<"$rows"
+  LS_COUNT="$i"
+}
+
+# Go straight to the interactive picker (no pre-listing).
+cmd_resume() {
+  _build_index
+  if (( LS_COUNT == 0 )); then
+    printf '%bno sessions to resume — start one: %bclaude-session <project>%b\n' \
+      "$DIM" "$BOLD" "$N"
+    return 0
+  fi
+  if (( PLAIN == 1 )) || [[ ! -t 0 || ! -t 1 ]]; then
+    printf '%bresume needs a terminal. Sessions: %s — attach with: %bclaude-session <project>%b\n' \
+      "$DIM" "$LS_COUNT" "$BOLD" "$N"
+    return 0
+  fi
+  if command -v fzf >/dev/null 2>&1; then _fzf_pick "$LS_COUNT"; else _menu_loop "$LS_COUNT"; fi
+}
+
+# Attach the session at index N (exec's tmux; only returns on error/no-tmux).
+_open_index() {
+  local i="$1" sess="${IDX_SESS[$i]:-}"
+  [[ -z "$sess" ]] && { printf '%bno session #%s%b\n' "$R" "$i" "$N"; return 1; }
+  if [[ "$sess" == "(detached)" || "$sess" == "(vscode)" ]]; then
+    printf '%b#%s is %s — not a reattachable tmux (this shell or a VS Code chat).%b\n' \
+      "$Y" "$i" "$sess" "$N"
+    return 1
+  fi
+  printf '%battaching %s …%b\n' "$DIM" "$sess" "$N"
+  _enter_session "$sess"
+}
+
+# Pure-bash picker (no fzf): number to open, p<number> to preview.
+_menu_loop() {
+  local maxn="$1" ans num i
+  # compact numbered list (fzf path shows its own; this one must print it itself)
+  for ((i=1;i<=maxn;i++)); do
+    local acct_tag=""
+    [[ "${IDX_ACCOUNT[$i]}" != "default" ]] && acct_tag="$(printf ' %b[%s]%b' "$M" "${IDX_ACCOUNT[$i]}" "$N")"
+    local badge; badge="$(_transfer_badge "${IDX_SID[$i]}" "${IDX_ACCOUNT[$i]}")"
+    local btxt=""; [[ -n "$badge" ]] && btxt="$(printf '  %b%s%b' "$DIM" "$badge" "$N")"
+    printf '%b[%d]%b %b%-22s%b%s %b%s%b%s\n' \
+      "$BOLD" "$i" "$N" "$BOLD" "${IDX_SESS[$i]}" "$N" "$acct_tag" \
+      "$Y" "$(truncate_str "$(_title_for_sid "${IDX_SID[$i]}" "${IDX_CWD[$i]}" "$(_account_dir_or_default "${IDX_ACCOUNT[$i]}")")" 52)" "$N" "$btxt"
+  done
+  while true; do
+    printf '\n%bselect%b  #=open · p#=preview · r=refresh · q=quit %b>%b ' \
+      "$BOLD" "$N" "$BOLD" "$N"
+    read -r ans || break
+    case "$ans" in
+      ''|q|Q)   break ;;
+      r|R)      exec "$0" resume ;;
+      p[0-9]*)  num="${ans#p}"
+                if (( num>=1 && num<=maxn )); then printf '\n'; _preview_for_sid "${IDX_SID[$num]}" "${IDX_CWD[$num]}" "$(_account_dir_or_default "${IDX_ACCOUNT[$num]}")"; else echo "?"; fi ;;
+      [0-9]*)   if (( ans>=1 && ans<=maxn )); then _open_index "$ans"; else echo "?"; fi ;;
+      *)        echo "?" ;;
+    esac
+  done
+}
+
+# fzf picker with a live preview pane (used when fzf is installed).
+# Fields: 1=sid  2=sess  3=display(shown)  4=cwd(hidden)  5=account(hidden) — 4 and 5 feed the preview hook.
+_fzf_pick() {
+  local maxn="$1" i line sid sess input=""
+  for ((i=1;i<=maxn;i++)); do
+    local acct_tag=""
+    [[ "${IDX_ACCOUNT[$i]}" != "default" ]] && acct_tag="$(printf '  %b[%s]%b' "$M" "${IDX_ACCOUNT[$i]}" "$N")"
+    local badge; badge="$(_transfer_badge "${IDX_SID[$i]}" "${IDX_ACCOUNT[$i]}")"
+    local btxt=""; [[ -n "$badge" ]] && btxt="$(printf '  %b%s%b' "$DIM" "$badge" "$N")"
+    input+="$(printf '%s\t%s\t%b%s%b  %b%s%b%s%s\t%s\t%s' \
+      "${IDX_SID[$i]}" "${IDX_SESS[$i]}" \
+      "$BOLD" "${IDX_SESS[$i]}" "$N" "$Y" "$(_title_for_sid "${IDX_SID[$i]}" "${IDX_CWD[$i]}" "$(_account_dir_or_default "${IDX_ACCOUNT[$i]}")")" "$N" "$acct_tag" "$btxt" \
+      "${IDX_CWD[$i]}" "${IDX_ACCOUNT[$i]}")"$'\n'
+  done
+  line="$(printf '%s' "$input" | fzf --ansi --delimiter='\t' --with-nth=3 \
+      --height=90% --reverse --prompt='open chat > ' \
+      --preview="$0 _preview {1} {4} {5}" --preview-window='right:60%:wrap')" || return 0
+  sid="$(cut -f1 <<<"$line")"; sess="$(cut -f2 <<<"$line")"
+  [[ -z "$sess" ]] && return 0
+  if [[ "$sess" == "(detached)" || "$sess" == "(vscode)" ]]; then
+    printf '%b%s is not a reattachable tmux.%b\n' "$Y" "$sess" "$N"; return 0
+  fi
+  _enter_session "$sess"
+}
+
+
+# ---- kill (interactive) ----------------------------------------------------
+cmd_kill() {
+  _build_index
+  if (( LS_COUNT == 0 )); then
+    printf '%bno sessions to kill — nothing running.%b\n' "$DIM" "$N"
+    return 0
+  fi
+  if (( PLAIN == 1 )) || [[ ! -t 0 || ! -t 1 ]]; then
+    printf '%bkill needs a terminal. Use: %bclaude-session kill <session>%b\n' "$DIM" "$BOLD" "$N"
+    return 0
+  fi
+
+  local i ram_mb ram_col title
+  printf '\n'
+  for ((i=1; i<=LS_COUNT; i++)); do
+    ram_mb="$(_pid_ram_mb "${IDX_PID[$i]}")"
+    ram_col="$N"
+    (( ram_mb > 800 )) && ram_col="$R" || { (( ram_mb > 400 )) && ram_col="$Y"; }
+    title="$(truncate_str "$(_title_for_sid "${IDX_SID[$i]}" "${IDX_CWD[$i]}" "$(_account_dir_or_default "${IDX_ACCOUNT[$i]}")")" 48)"
+    local acct_tag=""
+    [[ "${IDX_ACCOUNT[$i]}" != "default" ]] && acct_tag="$(printf '  %b[%s]%b' "$M" "${IDX_ACCOUNT[$i]}" "$N")"
+    printf '  %b[%d]%b  %b%-28s%b  %b%4sMB%b  %b%s%b%s\n' \
+      "$BOLD" "$i" "$N" \
+      "$BOLD" "${IDX_SESS[$i]}" "$N" \
+      "$ram_col" "$ram_mb" "$N" \
+      "$Y" "$title" "$N" "$acct_tag"
+  done
+
+  local total_mb=0
+  for ((i=1; i<=LS_COUNT; i++)); do
+    total_mb=$(( total_mb + $(_pid_ram_mb "${IDX_PID[$i]}") ))
+  done
+  printf '\n  %bTotal: %d session(s)  %sMB used%b\n' "$DIM" "$LS_COUNT" "$total_mb" "$N"
+  printf '  %b#=toggle · a=all · k=kill selected · q=quit%b\n' "$DIM" "$N"
+
+  local to_kill=() ans num found new_kill n sess pid
+  while true; do
+    local sel_str=""
+    if (( ${#to_kill[@]} > 0 )); then
+      sel_str=" $(printf '%b[%b' "$R" "$N")"
+      for n in "${to_kill[@]}"; do sel_str+="$n "; done
+      sel_str+="$(printf '%b]%b' "$R" "$N")"
+    fi
+    printf '\n%bkill%b%s %b>%b ' "$BOLD" "$N" "$sel_str" "$BOLD" "$N"
+    read -r ans || break
+    case "$ans" in
+      ''|q|Q) printf '%bcancelled%b\n' "$DIM" "$N"; break ;;
+      a|A)
+        to_kill=()
+        for ((i=1; i<=LS_COUNT; i++)); do to_kill+=("$i"); done
+        printf '%bselected all (%d sessions)%b\n' "$Y" "${#to_kill[@]}" "$N"
+        ;;
+      k|K)
+        if (( ${#to_kill[@]} == 0 )); then
+          printf '%bnothing selected — pick numbers first%b\n' "$DIM" "$N"; continue
+        fi
+        printf '%bAbout to kill:%b\n' "$R" "$N"
+        for num in "${to_kill[@]}"; do
+          ram_mb="$(_pid_ram_mb "${IDX_PID[$num]}")"
+          printf '  [%d] %s  %sMB\n' "$num" "${IDX_SESS[$num]}" "$ram_mb"
+        done
+        printf '%bConfirm kill %d session(s)? [y/N]%b ' "$R" "${#to_kill[@]}" "$N"
+        read -r confirm
+        if [[ "$confirm" == [yY] ]]; then
+          for num in "${to_kill[@]}"; do
+            sess="${IDX_SESS[$num]}"; pid="${IDX_PID[$num]}"
+            if tmux kill-session -t "$sess" 2>/dev/null; then
+              printf '  %b✓ tmux %s killed%b\n' "$Y" "$sess" "$N"
+            else
+              printf '  %b- tmux %s not found (may already be gone)%b\n' "$DIM" "$sess" "$N"
+            fi
+            if kill -TERM "$pid" 2>/dev/null; then
+              printf '  %b✓ SIGTERM → pid %s%b\n' "$Y" "$pid" "$N"
+            fi
+          done
+          printf '\n'
+          break
+        else
+          printf '%bcancelled%b\n' "$DIM" "$N"
+        fi
+        ;;
+      [0-9]*)
+        num="$ans"
+        if (( num >= 1 && num <= LS_COUNT )); then
+          found=0; new_kill=()
+          for n in "${to_kill[@]}"; do
+            (( n == num )) && found=1 || new_kill+=("$n")
+          done
+          if (( found == 0 )); then
+            new_kill+=("$num")
+            ram_mb="$(_pid_ram_mb "${IDX_PID[$num]}")"
+            printf '  %b+ [%d] %s  %sMB  — selected%b\n' "$Y" "$num" "${IDX_SESS[$num]}" "$ram_mb" "$N"
+          else
+            printf '  %b- [%d] %s  — deselected%b\n' "$DIM" "$num" "${IDX_SESS[$num]}" "$N"
+          fi
+          to_kill=("${new_kill[@]}")
+        else
+          printf '  ?\n'
+        fi
+        ;;
+      *) printf '  ?\n' ;;
+    esac
+  done
+}
+# ---- reap (kill orphaned dev processes found by _orphan_rows) -------------
+# Every live descendant of a pid, walked via ppid links from a fresh `ps`
+# snapshot — children printed before their parent (root last), so callers can
+# kill the whole subtree leaves-first.
+_pid_descendants() {
+  local root="$1"
+  local rows; rows="$(ps -eo pid=,ppid= 2>/dev/null || true)"
+  [[ -z "$rows" ]] && { printf '%s\n' "$root"; return 0; }
+  declare -A children
+  local pid ppid
+  while read -r pid ppid; do
+    [[ -z "$pid" ]] && continue
+    children[$ppid]+=" $pid"
+  done <<<"$rows"
+
+  local -a queue=("$root") order=()
+  local idx=0
+  while (( idx < ${#queue[@]} )); do
+    local cur="${queue[$idx]}"; idx=$((idx+1))
+    order+=("$cur")
+    local k
+    for k in ${children[$cur]:-}; do queue+=("$k"); done
+  done
+  local i
+  for (( i=${#order[@]}-1; i>=0; i-- )); do
+    printf '%s\n' "${order[$i]}"
+  done
+}
+
+# Re-verify a single pid still matches orphan criteria immediately before
+# killing it (processes are moving targets — a parent could reappear, or the
+# pid could already be gone), then TERM its subtree, wait, KILL survivors.
+# Never touches pid 1 or ourselves. Returns 1 (skip) on any safety failure.
+_reap_one() {
+  local pid="$1"
+  if [[ -z "$pid" || "$pid" == "$$" || "$pid" == "1" ]]; then
+    printf '  %bskip pid %s — refuses to touch self/init%b\n' "$R" "${pid:-?}" "$N"
+    return 1
+  fi
+  if ! _proc_alive "$pid"; then
+    printf '  %b- pid %s already gone%b\n' "$DIM" "$pid" "$N"
+    return 1
+  fi
+  local ppid comm
+  ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  comm="$(_proc_comm "$pid")"
+  if [[ "$ppid" != "1" ]]; then
+    printf '  %bskip pid %s — no longer an orphan (ppid=%s)%b\n' "$Y" "$pid" "${ppid:-?}" "$N"
+    return 1
+  fi
+  if [[ "$comm" =~ $_ORPHAN_PROTECTED_PATTERN ]]; then
+    printf '  %bskip pid %s — re-check says protected (%s)%b\n' "$Y" "$pid" "$comm" "$N"
+    return 1
+  fi
+
+  local -a victims=()
+  local v
+  while IFS= read -r v; do victims+=("$v"); done < <(_pid_descendants "$pid")
+  for v in "${victims[@]+"${victims[@]}"}"; do
+    [[ "$v" == "$$" || "$v" == "1" || -z "$v" ]] && continue
+    kill -TERM "$v" 2>/dev/null || true
+  done
+  sleep 5
+  for v in "${victims[@]+"${victims[@]}"}"; do
+    [[ "$v" == "$$" || "$v" == "1" || -z "$v" ]] && continue
+    _proc_alive "$v" && kill -9 "$v" 2>/dev/null || true
+  done
+  printf '  %b✓ reaped pid %s (%s)%b\n' "$G" "$pid" "$comm" "$N"
+  return 0
+}
+
+# `doctor --reap`: list, confirm, kill. Never kills unattended without --force.
+# Classifies every candidate with _orphan_activity BEFORE printing or
+# prompting — an orphan with real work still running in its subtree (an agent
+# job, a build, a test suite several levels down) must never be killed just
+# because the root pid itself is idle. See _orphan_activity for the full why.
+_do_reap() {
+  local orphan_rows; orphan_rows="$(_orphan_rows || true)"
+  if [[ -z "$orphan_rows" ]]; then
+    printf '%bnothing to reap%b\n' "$DIM" "$N"
+    return 0
+  fi
+
+  local -a idle_pids=() active_pids=()
+  local -A act_reason
+  local pid etimes pcpu comm args act
+  while IFS=$'\t' read -r pid etimes pcpu comm args; do
+    [[ -z "$pid" ]] && continue
+    act="$(_orphan_activity "$pid")"
+    if [[ "$act" == active$'\t'* ]]; then
+      active_pids+=("$pid")
+      act_reason[$pid]="${act#active$'\t'}"
+    else
+      idle_pids+=("$pid")
+    fi
+  done <<<"$orphan_rows"
+
+  printf '\n%borphans found:%b\n' "$BOLD" "$N"
+  while IFS=$'\t' read -r pid etimes pcpu comm args; do
+    if [[ -n "${act_reason[$pid]+x}" ]]; then
+      printf '  pid %-8s %-8s %5s%%  %-50s  %b(active — will be skipped)%b\n' \
+        "$pid" "$(_fmt_age_hm "$etimes")" "$pcpu" "$(truncate_str "$(_short_cmd "$args")" 50)" "$Y" "$N"
+    else
+      printf '  pid %-8s %-8s %5s%%  %s\n' \
+        "$pid" "$(_fmt_age_hm "$etimes")" "$pcpu" "$(truncate_str "$(_short_cmd "$args")" 50)"
+    fi
+  done <<<"$orphan_rows"
+
+  if (( ${#idle_pids[@]} == 0 )); then
+    printf '\n%bnothing reaped — every orphan has active work in its subtree (see above); rerun once it finishes%b\n' \
+      "$Y" "$N"
+    return 0
+  fi
+
+  if (( FORCE == 0 )); then
+    if [[ -t 0 ]]; then
+      printf '\n%breap %d orphaned process(es)? [y/N]%b ' "$R" "${#idle_pids[@]}" "$N"
+      local confirm; read -r confirm || confirm=""
+      if [[ "$confirm" != [yY] ]]; then
+        printf '%bcancelled%b\n' "$DIM" "$N"
+        return 0
+      fi
+    else
+      printf '%bclaude-session doctor --reap: refusing to kill without confirmation on a non-interactive stdin — pass --force to proceed unattended%b\n' \
+        "$R" "$N" >&2
+      return 2
+    fi
+  fi
+
+  # CRITICAL SAFETY: when $ORPHAN_PS_SRC is set, the process table is a test
+  # fixture — its pids (100001, 200003, …) are arbitrary numbers that can
+  # coincide with REAL, live pids on whatever host runs the test. Calling
+  # kill() on them would be indistinguishable from killing real processes on
+  # this box. So fixture mode is ALWAYS a dry run, no matter --force: print
+  # exactly what would happen and stop before any kill is issued. This is the
+  # only branch allowed to run non-interactively against a fake process table.
+  if [[ -n "${ORPHAN_PS_SRC:-}" ]]; then
+    printf '\n%b[dry-run] fixture process table ($ORPHAN_PS_SRC set) — no kill will be issued%b\n' "$Y" "$N"
+    local p
+    for p in "${idle_pids[@]}"; do
+      printf '  [dry-run] would reap pid %s\n' "$p"
+    done
+    for p in "${active_pids[@]+"${active_pids[@]}"}"; do
+      printf '  [dry-run] would skip pid %s — active work in its subtree: %s\n' "$p" "${act_reason[$p]}"
+    done
+    printf '\n%b[dry-run] reaped 0, skipped %d (busy), skipped 0 (failed re-verification)%b\n' \
+      "$BOLD" "${#active_pids[@]}" "$N"
+    return 0
+  fi
+
+  local reaped=0 busy_skipped=0 failed_skipped=0
+  local p
+  for p in "${active_pids[@]+"${active_pids[@]}"}"; do
+    printf '  %bskip pid %s — active work in its subtree: %s%b\n' "$Y" "$p" "${act_reason[$p]}" "$N"
+    busy_skipped=$((busy_skipped+1))
+  done
+  for p in "${idle_pids[@]}"; do
+    if _reap_one "$p"; then reaped=$((reaped+1)); else failed_skipped=$((failed_skipped+1)); fi
+  done
+  printf '\n%breaped %d, skipped %d (busy), skipped %d (failed re-verification)%b\n' \
+    "$BOLD" "$reaped" "$busy_skipped" "$failed_skipped" "$N"
+}
+
+# ---- doctor ----------------------------------------------------------------
+cmd_doctor() {
+  local out; out="$(_doctor_warnings || true)"
+  local count
+  if [[ -z "$out" ]]; then count=0; else count="$(wc -l <<<"$out")"; fi
+
+  box_top "Doctor"
+  if (( count == 0 )); then
+    box_msg "$GLYPH_CHECK " "all clear ($(_session_rows | wc -l) session(s) checked)"
+  else
+    # Each line from _doctor_warnings starts with a glyph (ANSI) followed by a space
+    # and the message. Pass through box_msg for wrapping. Indented continuation
+    # lines (start with 4 spaces) get rendered with their existing indent.
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      if [[ "$line" == "    "* ]]; then
+        # already-indented continuation
+        box_msg "    " "${line#    }" "      "
+      else
+        # extract the leading "<glyph> " prefix (everything up to the first non-ANSI space)
+        local prefix=""
+        local body="$line"
+        if [[ "$line" =~ ^($'\033'\[[0-9\;]*m)*[^[:space:]]+\  ]]; then
+          prefix="${BASH_REMATCH[0]}"
+          body="${line:${#prefix}}"
+        fi
+        box_msg "$prefix" "$body"
+      fi
+    done <<<"$out"
+    box_blank
+    box_line "$(printf '%b%d issue(s) flagged%b' "$Y" "$count" "$N")"
+  fi
+  box_bottom
+
+  if (( REAP == 1 )); then
+    _do_reap
+  fi
+}
+
+# ---- accounts subcommand ----------------------------------------------------
+cmd_accounts() {
+  local sub="${1:-ls}"
+  shift || true
+  case "$sub" in
+    add) cmd_accounts_add "$@" ;;
+    ls)  cmd_accounts_ls ;;
+    rm)  cmd_accounts_rm "$@" ;;
+    *)   echo "claude-session accounts: unknown subcommand '$sub' (use add, ls, or rm)" >&2; exit 2 ;;
+  esac
+}
+
+cmd_accounts_add() {
+  local name="${1:-}"
+  shift || true
+  local desc="$*"
+  [[ -n "$name" ]] || { echo "claude-session accounts add: name required" >&2; exit 2; }
+  [[ "$name" == "default" ]] && { echo "claude-session accounts add: 'default' is reserved for the built-in account" >&2; exit 2; }
+  [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "claude-session accounts add: name must match [a-zA-Z0-9_-]+" >&2; exit 2; }
+
+  local dir
+  dir="$(_account_config_dir "$name" 2>/dev/null)" || dir=""
+  if [[ -z "$dir" ]]; then
+    dir="$HOME/.claude-accounts/$name"
+    mkdir -p "$(dirname "$ACCOUNTS_CONF")"
+    if [[ ! -f "$ACCOUNTS_CONF" ]]; then
+      cat > "$ACCOUNTS_CONF" <<'HEADER'
+# ~/.config/claude-helpers/accounts.conf
+#
+# Registry of extra Claude Code accounts, each with its own isolated
+# CLAUDE_CONFIG_DIR (credentials, settings, session history, project data).
+# The default account (plain ~/.claude) always exists and needs no entry
+# here. Managed by `claude-session accounts add/ls/rm` — hand-editable too.
+#
+# Format: account <name> <config-dir> '<description>'
+HEADER
+    fi
+    printf 'account %s %s %s\n' "$name" "$dir" "$(printf '%q' "$desc")" >> "$ACCOUNTS_CONF"
+    echo "claude-session: registered account '$name' -> $dir" >&2
+  fi
+  mkdir -p "$dir"
+
+  echo "claude-session: launching claude under '$name' — run /login, then Ctrl-D to finish setup." >&2
+  CLAUDE_CONFIG_DIR="$dir" claude
+}
+
+cmd_accounts_ls() {
+  box_top "Claude accounts"
+  local first=1
+  while IFS=$'\t' read -r name dir; do
+    if (( !first )); then box_blank; fi
+    first=0
+    local desc="${ACCT_DESC[$name]:-}"
+    [[ "$name" == "default" ]] && desc="${desc:-plain ~/.claude, no CLAUDE_CONFIG_DIR}"
+    local logged_in="$GLYPH_DASH"
+    [[ -f "$dir/.credentials.json" ]] && logged_in="$GLYPH_CHECK"
+    box_line "$(printf '%b%-10s%b %b %b%s%b' "$BOLD" "$name" "$N" "$logged_in" "$DIM" "$(short_home "$dir")" "$N")"
+    [[ -n "$desc" ]] && box_line "$(printf '  %b%s%b' "$Y" "$desc" "$N")"
+  done < <(_all_accounts)
+  box_bottom
+}
+
+cmd_accounts_rm() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || { echo "claude-session accounts rm: name required" >&2; exit 2; }
+  [[ "$name" == "default" ]] && { echo "claude-session accounts rm: cannot remove the default account" >&2; exit 2; }
+  local dir
+  dir="$(_account_config_dir "$name")" || { echo "claude-session accounts rm: unknown account '$name'" >&2; exit 2; }
+  [[ -f "$ACCOUNTS_CONF" ]] || { echo "claude-session accounts rm: no accounts.conf found" >&2; exit 2; }
+  local tmp; tmp="$(mktemp)"
+  local grep_rc=0
+  grep -vE "^account[[:space:]]+$name([[:space:]]|\$)" "$ACCOUNTS_CONF" > "$tmp" || grep_rc=$?
+  if (( grep_rc >= 2 )); then
+    rm -f "$tmp"
+    echo "claude-session accounts rm: failed to filter accounts.conf (grep exit $grep_rc) — registry left untouched" >&2
+    exit 1
+  fi
+  mv "$tmp" "$ACCOUNTS_CONF"
+  echo "claude-session: unregistered '$name'. Config dir kept at $dir — delete manually if you want:" >&2
+  echo "  rm -rf $(printf '%q' "$dir")" >&2
+}
+
+
+
+
+
+
+
+
+# ---- dup-guard helper ------------------------------------------------------
+# Prints offender description if this project+account already has a bridged
+# Claude; 0 = yes. Scoped to the target account's own session-state dir, so a
+# different account may hold its own bridge in the same directory.
+_project_already_bridged() {
+  local project_dir="$1" account="${2:-default}"
+  local sdir; sdir="$(_account_dir_or_default "$account")/sessions"
+  shopt -s nullglob
+  local f
+  for f in "$sdir"/*.json; do
+    local pid cwd bridge sess
+    pid="$(jq -r '.pid // empty' "$f")"
+    [[ -z "$pid" ]] && continue
+    _proc_alive "$pid" || continue
+    cwd="$(jq -r '.cwd // empty' "$f")"
+    [[ "$cwd" != "$project_dir" ]] && continue
+    bridge="$(jq -r '.bridgeSessionId // empty' "$f")"
+    [[ -z "$bridge" ]] && continue
+    sess="$(owner_tmux "$pid")"
+    [[ -z "$sess" ]] && sess="(detached/vscode)"
+    echo "tmux=$sess pid=$pid bridge=${bridge#session_}"
+    return 0
+  done
+  return 1
+}
+
+# ---- argument parsing ------------------------------------------------------
+# Split off a `--` passthrough tail before flag parsing (everything after `--`
+# is forwarded to native claude verbatim; pre-`--` flags like --account still apply).
+PASSTHROUGH=0; NATIVE_ARGS=()
+_pre=(); _seen_dd=0
+for a in "$@"; do
+  if (( _seen_dd )); then NATIVE_ARGS+=("$a"); continue; fi
+  if [[ "$a" == "--" ]]; then _seen_dd=1; PASSTHROUGH=1; continue; fi
+  _pre+=("$a")
+done
+set -- "${_pre[@]+"${_pre[@]}"}"
+
+FORCE=0
+PLAIN=0
+REAP=0
+SHOW_VERSION=0
+HANDOFF=""
+CLAUDE_MODE="interactive"
+ACCOUNT=""
+TO_ACCOUNT=""
+FROM_ACCOUNT="default"
+TRANSFER_MOVE=0
+TRANSFER_LIMIT=50
+TRANSFER_LAUNCH=0
+SCHED_CHAT=""; SCHED_NEW=0; SCHED_WHEN_KIND=""; SCHED_WHEN_VAL=""; SCHED_TIMEOUT=""; SCHED_CWD=""
+SCHED_MODEL=""; SCHED_ALL_ACCOUNTS=0
+SCHED_AT=""; SCHED_IN=""
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --force|-f)   FORCE=1 ;;
+    --plain)      PLAIN=1 ;;
+    --reap)       REAP=1 ;;
+    --version)    SHOW_VERSION=1 ;;
+    # -p means --plain for own verbs; for native routing it's re-injected as
+    # claude's --print alias at the native fall-through dispatch (never in ARGS,
+    # so own-verb dispatch stays clean: `kill -p` → cmd_kill, `-p kill` → own kill).
+    -p)           PLAIN=1 ;;
+    --handoff=*)  HANDOFF="${a#*=}" ;;
+    --mode=*)     CLAUDE_MODE="${a#*=}" ;;
+    --account=*)  ACCOUNT="${a#*=}" ;;
+    --to=*)       TO_ACCOUNT="${a#*=}" ;;
+    --from=*)     FROM_ACCOUNT="${a#*=}" ;;
+    --move)       TRANSFER_MOVE=1 ;;
+    --limit=*)    TRANSFER_LIMIT="${a#*=}" ;;
+    --launch)     TRANSFER_LAUNCH=1 ;;
+    --chat=*)      SCHED_CHAT="${a#*=}" ;;
+    --new)         SCHED_NEW=1 ;;
+    --every=*)     SCHED_WHEN_KIND="every";    SCHED_WHEN_VAL="${a#*=}" ;;
+    --daily-at=*)  SCHED_WHEN_KIND="daily-at"; SCHED_WHEN_VAL="${a#*=}" ;;
+    --once=*)      SCHED_WHEN_KIND="once";     SCHED_WHEN_VAL="${a#*=}" ;;
+    --timeout=*)   SCHED_TIMEOUT="${a#*=}" ;;
+    --cwd=*)       SCHED_CWD="${a#*=}" ;;
+    --all-accounts) SCHED_ALL_ACCOUNTS=1 ;;
+    --at=*)        SCHED_AT="${a#*=}" ;;
+    --in=*)        SCHED_IN="${a#*=}" ;;
+    -h|--help)    awk 'NR>1 && /^set -euo pipefail/{exit} NR>1{print}' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)            ARGS+=("$a") ;;
+  esac
+done
+set -- "${ARGS[@]:-}"
+a1="${1:-}"; a2="${2:-}"
+
+case "$CLAUDE_MODE" in
+  interactive|plan|autopilot) ;;
+  *) echo "claude-session: invalid mode '$CLAUDE_MODE' (use interactive, plan, or autopilot)" >&2; exit 2 ;;
+esac
+[[ "$TRANSFER_LIMIT" =~ ^[0-9]+$ ]] \
+  || { echo "claude-session: --limit must be a non-negative integer (0 = no cap)" >&2; exit 2; }
+if [[ -n "$HANDOFF" ]]; then
+  HANDOFF="$(_readlink_f "$HANDOFF" 2>/dev/null || true)"
+  [[ -n "$HANDOFF" && -r "$HANDOFF" ]] \
+    || { echo "claude-session: --handoff must name a readable file" >&2; exit 2; }
+fi
+
+ACCOUNT_DIR=""
+if [[ -n "$ACCOUNT" && "$ACCOUNT" != "default" ]]; then
+  [[ "$ACCOUNT" =~ ^[a-zA-Z0-9_-]+$ ]] \
+    || { echo "claude-session: --account name must match [a-zA-Z0-9_-]+" >&2; exit 2; }
+  ACCOUNT_DIR="$(_account_config_dir "$ACCOUNT")" \
+    || { echo "claude-session: unknown account '$ACCOUNT' — register it first: claude-session accounts add $ACCOUNT" >&2; exit 2; }
+fi
+ACCOUNT_SUFFIX=""
+[[ -n "$ACCOUNT" && "$ACCOUNT" != "default" ]] && ACCOUNT_SUFFIX="-${ACCOUNT//[.:]/_}"
+
+# ---- native claude pass-through --------------------------------------------
+_NATIVE_SUBCMDS="update upgrade mcp auth install setup-token agents doctor ultrareview config plugin plugins project"
+
+# Is this argv a native claude invocation (subcommand or session/print flag)?
+_is_native_invocation() {
+  local first="${1:-}"; shift || true
+  case " $_NATIVE_SUBCMDS " in *" $first "*) return 0 ;; esac
+  local a
+  for a in "$first" "$@"; do
+    case "$a" in
+      -r|--resume|--resume=*|-c|--continue|--from-pr|-p|--print|\
+      --model|--model=*|--agent|--agent=*|--session-id|--session-id=*|--fork-session|--json) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# One-shot (inline) vs interactive (tmux) for a native invocation.
+_native_is_inline() {
+  local first="${1:-}"; local a
+  for a in "$@"; do case "$a" in -p|--print|--version|--json) return 0 ;; esac; done
+  case "$first" in
+    update|upgrade|install|setup-token|mcp) return 0 ;;
+    auth) [[ "${2:-}" == "status" ]] && return 0; return 1 ;;
+  esac
+  return 1
+}
+
+# Launch `claude <args…>` in a durable tmux session, then enter it.
+# _launch_native <sess> <dir> <acct_config_dir> -- <claude args…>
+_launch_native() {
+  local sess="$1" dir="$2" acct_dir="$3"; shift 3
+  [[ "${1:-}" == "--" ]] && shift
+  command -v claude >/dev/null 2>&1 || { echo "claude-session: 'claude' not in PATH" >&2; exit 1; }
+  local claude_cmd exit_message fallback_shell env_prefix
+  printf -v claude_cmd '%q ' claude "$@"
+  printf -v exit_message '%q' '[claude-session] Claude exited — run claude again or Ctrl-D to close.'
+  printf -v fallback_shell '%q' "${SHELL:-bash}"
+  env_prefix=""
+  [[ -n "$acct_dir" ]] && printf -v env_prefix 'CLAUDE_CONFIG_DIR=%q ' "$acct_dir"
+  tmux new-session -d -s "$sess" -c "$dir" \
+    "$env_prefix$claude_cmd; printf '\\n%s\\n' $exit_message; exec $fallback_shell"
+  _enter_session "$sess"
+}
+
+# Forward a native invocation: inline (exec) or tmux, honoring --account.
+_dispatch_native() {
+  local -a nargs=("$@")
+  local acct_dir=""; [[ -n "$ACCOUNT" && "$ACCOUNT" != "default" ]] && acct_dir="$ACCOUNT_DIR"
+  if _native_is_inline "${nargs[@]+"${nargs[@]}"}"; then
+    command -v claude >/dev/null 2>&1 || { echo "claude-session: 'claude' not in PATH" >&2; exit 1; }
+    if [[ -n "$acct_dir" ]]; then exec env CLAUDE_CONFIG_DIR="$acct_dir" claude "${nargs[@]+"${nargs[@]}"}"; else exec claude "${nargs[@]+"${nargs[@]}"}"; fi
+  fi
+  local dir; dir="$(pwd)"
+  local sbase; sbase="$(basename "$dir")"; sbase="${sbase//[.:]/_}"
+  local sess="$sbase-claude$ACCOUNT_SUFFIX"
+  if tmux has-session -t "$sess" 2>/dev/null; then _enter_session "$sess"; fi
+  _launch_native "$sess" "$dir" "$acct_dir" -- "${nargs[@]+"${nargs[@]}"}"
+}
+
+case "$a1" in
+  ls)       cmd_ls;     exit 0 ;;
+  resume)   cmd_resume; exit 0 ;;
+  doctor)   cmd_doctor; exit $? ;;
+  accounts) cmd_accounts "${@:2}"; exit 0 ;;
+  transfer) cmd_transfer "${@:2}"; _transfer_maybe_launch; exit 0 ;;
+  schedule)      cmd_schedule "${@:2}"; exit 0 ;;
+  _schedule-run) cmd_schedule_run "$a2"; exit $? ;;
+  _preview) _preview_for_sid "$a2" "${3:-}" "$(_account_dir_or_default "${4:-default}")"; exit 0 ;;   # internal: fzf preview hook (sid, cwd, account)
+  kill)
+    if [[ -z "$a2" ]]; then cmd_kill; else tmux kill-session -t "$a2"; fi
+    exit 0 ;;
+esac
+
+if (( SHOW_VERSION == 1 )); then
+  printf 'claude-session %s\n' "$VERSION"
+  printf '  platform   %s (%s)\n' "$(_compat_os)" "$(uname -sr 2>/dev/null)"
+  printf '  bash       %s\n' "${BASH_VERSION:-unknown}"
+  printf '  lib        %s\n' "$CLAUDE_HELPERS_LIB"
+  printf '  claude     %s\n' "$(command -v claude >/dev/null 2>&1 && claude --version 2>/dev/null | head -1 || echo 'not found')"
+  printf '\nfor Claude Code'"'"'s own version:  claude-session -- --version\n'
+  exit 0
+fi
+
+# Native claude pass-through (after own verbs, before project resolution).
+if (( PASSTHROUGH == 1 )); then
+  _dispatch_native "${NATIVE_ARGS[@]+"${NATIVE_ARGS[@]}"}"; exit $?
+fi
+if [[ -n "$a1" ]] && ! [[ -d "$HOME/$a1" ]] && _is_native_invocation "$@"; then
+  _nat=("$@")
+  (( PLAIN == 1 )) && _nat+=(-p)
+  _dispatch_native "${_nat[@]+"${_nat[@]}"}"; exit $?
+fi
+
+# Resolve PROJECT + DIR from positional args / cwd.
+if [[ -n "$a1" && "$a1" != "new" && ! "$a1" =~ ^[0-9]+$ && -d "$HOME/$a1" ]]; then
+  PROJECT="$a1"; DIR="$HOME/$a1"; SUFFIX="$a2"
+else
+  DIR="$(pwd)"; PROJECT="$(basename "$DIR")"; SUFFIX="$a1"
+fi
+[[ -d "$DIR" ]] || { echo "claude-session: no such dir: $DIR" >&2; exit 1; }
+
+# tmux silently rewrites '.' and ':' to '_' in stored session names, but treats
+# them as window/pane separators inside a `-t` target. A project whose name
+# contains them (e.g. "my.site-system") thus gets created fine yet can never
+# be attached/matched ("can't find window: my"). Sanitize to match tmux.
+SBASE="${PROJECT//[.:]/_}"
+SESS="$SBASE-claude$ACCOUNT_SUFFIX"
+if [[ "$SUFFIX" == "new" ]]; then
+  n=1; while tmux has-session -t "$SBASE-claude$ACCOUNT_SUFFIX-$n" 2>/dev/null; do n=$((n+1)); done
+  SESS="$SBASE-claude$ACCOUNT_SUFFIX-$n"
+elif [[ "$SUFFIX" =~ ^[0-9]+$ ]]; then
+  SESS="$SBASE-claude$ACCOUNT_SUFFIX-$SUFFIX"
+fi
+
+command -v claude >/dev/null 2>&1 || { echo "claude-session: 'claude' not in PATH" >&2; exit 1; }
+
+if tmux has-session -t "$SESS" 2>/dev/null; then
+  echo "claude-session: re-attaching '$SESS'" >&2
+  _enter_session "$SESS"
+fi
+
+acct_disp=""
+acct_flag=""
+if [[ -n "$ACCOUNT" && "$ACCOUNT" != "default" ]]; then
+  acct_disp=" (account: $ACCOUNT)"
+  acct_flag=" --account=$ACCOUNT"
+fi
+
+if (( FORCE == 0 )); then
+  if existing="$(_project_already_bridged "$DIR" "${ACCOUNT:-default}")"; then
+    cat >&2 <<MSG
+${R}claude-session: refusing to start '$SESS'.${N}
+  Another Claude session for $(short_home "$DIR")$acct_disp already owns the Remote Control bridge:
+    $existing
+  Options:
+    - reattach:         claude-session $PROJECT$acct_flag          (uses tmux attach)
+    - explicit second:  claude-session $PROJECT new$acct_flag      (will warn again)
+    - force this one:   claude-session $PROJECT ${SUFFIX:-}$acct_flag --force
+  Diagnose:  claude-session doctor
+MSG
+    exit 2
+  fi
+fi
+
+echo "claude-session: starting '$SESS' in $DIR$acct_disp  (inside: /rc phone, /ide VSCode)" >&2
+claude_args=()
+if [[ -n "$HANDOFF" ]]; then
+  handoff_dir="$(dirname "$HANDOFF")"
+  case "$CLAUDE_MODE" in
+    plan)      claude_args+=(--permission-mode plan) ;;
+    autopilot) claude_args+=(--permission-mode acceptEdits) ;;
+  esac
+  claude_args+=(--add-dir "$handoff_dir")
+  claude_args+=("Take over the prior agent session documented in $HANDOFF. Read the handoff completely before acting. Inspect the current cwd, branch, HEAD, and git status; compare them with the handoff; then respond with a HANDOFF ACK containing verified completed work, stale or conflicting claims, remaining priorities, and the first proposed check. Do not modify files or run mutating commands until the user confirms.")
+fi
+_launch_native "$SESS" "$DIR" "$ACCOUNT_DIR" -- "${claude_args[@]+"${claude_args[@]}"}"

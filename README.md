@@ -67,7 +67,7 @@ Reattach later from any client with the same command.
 ## Install
 
 ```bash
-git clone https://github.com/<you>/claude-session.git
+git clone https://github.com/merkelis-p/claude-session.git
 cd claude-session
 ./install.sh                   # installs to ~/.local by default
 ```

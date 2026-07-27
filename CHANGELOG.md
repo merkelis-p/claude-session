@@ -24,5 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   long-running scheduled prompts.
 - `doctor` orphan and stuck-build detection, with an opt-in `--reap` to clean
   up orphaned dev processes.
-- Linux/macOS portability layer so the tool runs unmodified on both
-  platforms.
+- Linux/macOS portability layer: process, date, stat, readlink and timeout
+  differences are handled in one compat shim rather than at each call site,
+  and a bash 4 guard reports stock macOS bash 3.2 with a readable message.
+
+### Known limitations
+
+- The scheduler (`schedule`, `keepalive`) requires systemd user timers and so
+  works on Linux only. There is no launchd backend yet; every other subcommand
+  is platform-independent. See `docs/platforms.md`.

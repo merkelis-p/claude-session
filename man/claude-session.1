@@ -1,0 +1,287 @@
+.TH CLAUDE-SESSION 1 "2026-07-27" "claude-session 0.1.0" "User Commands"
+.SH NAME
+claude-session \- launch/attach Claude Code sessions in tmux, with multi-account
+support, chat transfer, scheduling, and a doctor view
+.SH SYNOPSIS
+.B claude-session
+.RI [ project ]
+.RI [ new | N ]
+.br
+.B claude-session
+.RI [ verb ]
+.RI [ options ]
+.SH DESCRIPTION
+.B claude-session
+launches or attaches a Claude Code session inside
+.BR tmux (1),
+so it survives SSH or editor-tunnel disconnects. It provides state-aware
+duplicate detection, multiple isolated Claude Code accounts, chat title
+tracking, a
+.B doctor
+view for stuck or orphaned processes, on-disk chat transfer between accounts,
+and prompt scheduling via the platform's user-level scheduler.
+.SH COMMANDS
+.TP
+.B claude-session
+Project is the current directory's basename; attaches to (or creates)
+session \fI<project>\fR-claude.
+.TP
+.BI "claude-session " project
+Attach to (or create) session \fI<project>\fR-claude.
+.TP
+.BI "claude-session " project " new"
+Next free \fI<project>\fR-claude-\fIN\fR.
+.TP
+.BI "claude-session " project " " N
+Specific \fI<project>\fR-claude-\fIN\fR.
+.TP
+.B claude-session new
+From inside \fI~/<project>\fR, next free numbered session.
+.TP
+.B claude-session ls
+List sessions: numbered cards and chat titles, no picker.
+.TP
+.B claude-session resume
+Interactive picker: choose a chat to open or preview (uses
+.BR fzf (1)
+if present).
+.TP
+.B claude-session doctor
+Find duplicate sessions, stalls, dead session files, orphaned dev processes
+(ppid=1), and stuck builds.
+.TP
+.B claude-session doctor --reap [--force]
+Kill the orphaned dev processes found by
+.BR doctor .
+Confirms interactively unless
+.BR --force .
+.TP
+.B claude-session kill
+Interactive: pick session(s) to kill, shows RAM usage.
+.TP
+.BI "claude-session kill " session
+Direct
+.B tmux kill-session
+shortcut.
+.TP
+.BI "claude-session accounts add " name " [description]"
+Register a new account and run an interactive
+.B /login
+under it.
+.TP
+.B claude-session accounts ls
+List registered accounts.
+.TP
+.BI "claude-session accounts rm " name
+Unregister an account (credentials are left on disk).
+.TP
+.BI "claude-session " "native-claude-args"
+Runs native
+.BR claude (1)
+pass-through: inline (exec) for one-shot verbs like \fBupdate\fR/\fBmcp\fR,
+tmux for interactive ones like \fB--resume\fR.
+.TP
+.BI "claude-session -- " args
+Forces native routing, for verbs that clash with claude-session's own
+(e.g. \fB-- doctor\fR). Both forms honor \fB--account=\fR.
+.TP
+.BI "claude-session transfer " "[sessionId]" " --to=" account " [--from=" account "] [--move] [--force] [--limit=" N "] [--launch]"
+Copy (or, with \fB--move\fR, move) one chat's on-disk state between accounts.
+Omit \fIsessionId\fR to pick from the source account's chats across every
+project (50 most recent by default; \fB--limit=0\fR for all). Pure data
+operation; never touches tmux. \fB--launch\fR reopens the moved chat, resumed,
+under the destination account.
+.TP
+.BI "claude-session transfer log " "[--from=A --to=B --sid=S --since=DATE --limit=N]"
+Show the transfer history (ledger).
+.TP
+.BI "claude-session transfer undo " "[sid|id]"
+Reverse the last (or a named) transfer.
+.TP
+.BI "claude-session transfer redo " id
+Re-apply a logged transfer.
+.TP
+.BI "claude-session transfer prune " id
+Drop a ledger record (keeps the chat data).
+.TP
+.BI "claude-session schedule add " prompt " (--chat=" sid "|--new) (--every=" dur "|--daily-at=" HH:MM "|--once=\(dqYYYY-MM-DD HH:MM\(dq) [--account=] [--mode=plan|autopilot] [--cwd=] [--timeout=]"
+Schedule a prompt via the platform scheduler (systemd user timer on Linux,
+launchd on macOS).
+.TP
+.BI "claude-session schedule ls|log " id "|rm " id "|run " id
+List, inspect, remove, or fire a scheduled prompt.
+.TP
+.BI "claude-session schedule keepalive " "[--account=NAME|--all-accounts] [--every=" dur "] [--at=" HH:MM "|--in=" dur "]"
+Create (idempotently) a self-pinging low-cost schedule per account, to keep
+its 5-hour usage window warm. Details:
+.IR docs/keepalive.md
+in the source distribution.
+.SH OPTIONS
+.TP
+.BR --force ", " -f
+Override the "already RC-bridged" guard; for \fBtransfer\fR, allow
+overwriting at the destination.
+.TP
+.BI --to= NAME
+Transfer destination account (required by \fBtransfer\fR).
+.TP
+.BI --from= NAME
+Transfer source account (default: the default account).
+.TP
+.B --move
+Transfer removes the source copy instead of keeping it.
+.TP
+.BI --limit= N
+Transfer picker: how many recent chats to list (0 = all).
+.TP
+.BR --plain ", " -p
+Force non-interactive mode (no picker even in \fBresume\fR).
+.TP
+.B --reap
+With \fBdoctor\fR: kill orphaned dev processes (ppid=1); needs a TTY confirm
+or \fB--force\fR.
+.TP
+.BI --handoff= FILE
+Read \fIFILE\fR as initial takeover context (any agent's handoff).
+.TP
+.BI --mode= MODE
+\fBinteractive\fR, \fBplan\fR, or \fBautopilot\fR (maps to
+\fB--permission-mode\fR).
+.TP
+.BI --account= NAME
+Run under a registered account's isolated \fBCLAUDE_CONFIG_DIR\fR (session
+becomes \fI<project>\fR-claude-\fINAME\fR); omit for the default account.
+.TP
+.B --all-accounts
+With \fBschedule keepalive\fR: create the keepalive schedule for every
+registered account (default account included) instead of just one.
+.TP
+.BI --at= HH:MM
+With \fBschedule keepalive\fR: anchor the first fire to this clock time
+(24h, e.g. an account's known 5-hour usage-window reset) instead of firing
+one minute after creation. Single-account only; ignored (with a warning)
+under \fB--all-accounts\fR, since every account resets at a different time.
+.TP
+.BI --in= DURATION
+With \fBschedule keepalive\fR: anchor the first fire this far in the future
+(a systemd span like \fB3h\fR) instead of one minute after creation.
+Single-account only, same caveat as \fB--at\fR.
+.TP
+.B --version
+Print the claude-session version, platform, bash version, resolved library
+directory, and the native \fBclaude\fR version. Use
+\fBclaude-session -- --version\fR for Claude Code's own version.
+.SH FILES
+.TP
+.I ~/.config/claude-helpers/accounts.conf
+Registered account list (bash-sourced, one \fBaccount\fR call per line).
+.TP
+.I ~/.config/claude-helpers/transfer-log.jsonl
+The transfer ledger: one JSON object per line, one line per
+\fBtransfer\fR/\fBundo\fR/\fBredo\fR event. Overridable via
+\fBLEDGER_FILE\fR.
+.TP
+.I ~/.config/claude-helpers/schedules/
+One subdirectory per scheduled prompt (\fImeta\fR and \fIprompt.txt\fR).
+Overridable via \fBSCHED_DIR\fR.
+.TP
+.I ~/.config/systemd/user/claude-schedule-*.{service,timer}
+Generated systemd user units backing each schedule on Linux. Overridable via
+\fBSYSTEMD_USER_DIR\fR.
+.TP
+.I <config-dir>/sessions/*.json
+Live per-process session state Claude Code itself writes; \fIconfig-dir\fR
+is \fI~/.claude\fR for the default account, or the directory registered for
+a named account.
+.TP
+.I <config-dir>/projects/*/*.jsonl
+Chat transcripts — what \fBtransfer\fR copies or moves between accounts.
+.SH ENVIRONMENT
+.TP
+.B CLAUDE_CONFIG_DIR
+Overrides the active account's Claude Code config directory; set
+automatically by \fB--account=\fR, but can also be set directly by callers
+that want to run one-off commands under a specific account.
+.TP
+.B CLAUDE_HELPERS_LIB
+Overrides the resolved library directory (normally found relative to
+\fBbin/claude-session\fR's own, symlink-followed location). Set this if the
+library files live somewhere \fBclaude-session\fR cannot infer.
+.TP
+.B LEDGER_FILE
+Overrides the transfer ledger path (default
+\fI~/.config/claude-helpers/transfer-log.jsonl\fR).
+.TP
+.B SCHED_DIR
+Overrides the schedules directory (default
+\fI~/.config/claude-helpers/schedules\fR).
+.TP
+.B SYSTEMD_USER_DIR
+Overrides where generated systemd user units are written (default
+\fI~/.config/systemd/user\fR).
+.TP
+.B ORPHAN_PS_SRC
+When set, points \fBdoctor\fR's process-table scan at a fixture file instead
+of the real process table — used by the test suite for hermetic, host-
+independent orphan/stuck-build detection. Also forces \fBdoctor --reap\fR
+into a dry run, since fixture pids are arbitrary numbers that could
+coincide with real, live pids on the host running the test.
+.TP
+.B CLAUDE_COMPAT_OS
+Overrides platform detection (\fBlinux\fR or \fBdarwin\fR) in the
+compatibility layer; used by tests to exercise both branches from one host.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+A runtime error: missing dependency, unreadable file, unknown account, a
+failed ledger write, or similar.
+.TP
+.B 2
+Invalid usage: a required flag was missing (e.g. \fBtransfer\fR without
+\fB--to=\fR), an argument failed validation (e.g. a malformed
+\fB--every=\fR span), or \fBdoctor --reap\fR was asked to run unattended
+without \fB--force\fR on a non-interactive stdin.
+.PP
+\fBdoctor\fR itself (without \fB--reap\fR) exits with the count of issues
+found, so \fB0\fR also means "all clear" there specifically.
+.SH EXAMPLES
+.TP
+Attach to (or start) the current directory's session:
+.B claude-session
+.TP
+Start a second, independent session for the same project:
+.B claude-session myproject new
+.TP
+List every session across every account:
+.B claude-session ls
+.TP
+Run the health check, then clean up anything it flagged as reapable:
+.B claude-session doctor
+.br
+.B claude-session doctor --reap
+.TP
+Register a second account and use it for one project:
+.B claude-session accounts add work
+.br
+.B claude-session myproject --account=work
+.TP
+Copy the currently-picked chat to another account and reopen it there:
+.B claude-session transfer --to=work --launch
+.TP
+Schedule a daily standup-summary prompt against a fresh chat:
+.B claude-session schedule add "Summarize yesterday's commits" --new --daily-at=09:00
+.TP
+Print claude-session's own version:
+.B claude-session --version
+.TP
+Print Claude Code's own version instead:
+.B claude-session -- --version
+.SH SEE ALSO
+.BR tmux (1),
+.BR claude (1),
+.BR fzf (1),
+.BR systemd.timer (5),
+.BR launchd.plist (5)

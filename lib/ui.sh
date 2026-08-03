@@ -32,6 +32,43 @@ _vlen() {
   LC_ALL=C.UTF-8 awk -v s="$1" 'BEGIN{ gsub(/\033\[[0-9;]*m/, "", s); print length(s) }'
 }
 
+# Truncate to a visible width without breaking colors.
+# _vtrunc <string> <max-visible-chars>   (the appended '…' counts toward max)
+#
+# A plain `${s:0:n}` cannot be used here: it counts bytes, so it mangles UTF-8,
+# and it counts ANSI escapes against the budget, so a colored line truncates
+# earlier than an identical plain one and can be cut mid-escape — leaving the
+# terminal stuck in that color for every following line. This walks the string
+# instead, copying escape sequences through without charging them to the budget.
+_vtrunc() {
+  local ell; printf -v ell '\xe2\x80\xa6'
+  LC_ALL=C.UTF-8 awk -v s="$1" -v max="$2" -v ell="$ell" '
+    BEGIN {
+      if (max <= 0) { printf "%s", ""; exit }
+      # Already fits: return it untouched. Appending an ellipsis to content that
+      # fits would be a lie about the content having been cut. box_line only
+      # calls this when the line is too long, but callers cannot be assumed to
+      # have checked — the helper has to be correct on its own.
+      vis_s = s; gsub(/\033\[[0-9;]*m/, "", vis_s)
+      if (length(vis_s) <= max) { printf "%s", s; exit }
+      budget = max - 1          # leave room for the ellipsis
+      n = length(s); i = 1; vis = 0; out = ""; sawesc = 0
+      while (i <= n) {
+        c = substr(s, i, 1)
+        if (c == "\033") {      # copy the escape verbatim, cost 0
+          j = i
+          while (j <= n && substr(s, j, 1) !~ /[a-zA-Z]/) j++
+          out = out substr(s, i, j - i + 1); i = j + 1; sawesc = 1
+          continue
+        }
+        if (vis >= budget) break
+        out = out c; vis++; i++
+      }
+      # Reset only if we actually emitted color, so plain text stays plain.
+      printf "%s%s%s", out, ell, (sawesc ? "\033[0m" : "")
+    }'
+}
+
 # Pick frame width once per script invocation.
 _pick_width() {
   local w="${COLUMNS:-0}"
@@ -52,10 +89,22 @@ box_top() {
   printf '\xe2\x95\xae\n'
 }
 
+# Content wider than the frame must be TRUNCATED, not just left unpadded.
+# Without this the closing '│' is pushed past the frame edge and the whole box
+# visibly comes apart — one long chat title was enough to wreck a listing.
+# Truncation is width-aware (ANSI escapes stripped, Unicode counted as
+# characters) and appends '…' so it is obvious that something was cut. The
+# escape sequences themselves are never counted against the budget, so colored
+# content truncates at the same visible column as plain content.
 box_line() {
-  local line="$1" w pad
+  local line="$1" w pad inner
+  inner=$(( UI_W - 4 ))
   w=$(_vlen "$line")
-  pad=$(( UI_W - w - 4 ))
+  if (( w > inner )); then
+    line="$(_vtrunc "$line" "$inner")"
+    w=$(_vlen "$line")
+  fi
+  pad=$(( inner - w ))
   printf '\xe2\x94\x82 %b' "$line"
   (( pad > 0 )) && printf '%*s' "$pad" ''
   printf ' \xe2\x94\x82\n'

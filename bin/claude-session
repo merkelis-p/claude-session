@@ -1275,6 +1275,30 @@ TRANSFER_LAUNCH=0
 SCHED_CHAT=""; SCHED_NEW=0; SCHED_WHEN_KIND=""; SCHED_WHEN_VAL=""; SCHED_TIMEOUT=""; SCHED_CWD=""
 SCHED_MODEL=""; SCHED_ALL_ACCOUNTS=0
 SCHED_AT=""; SCHED_IN=""
+# Normalize `--flag value` into `--flag=value` for our own value-taking options,
+# so the matcher below only has to know one shape.
+#
+# Only the `=` shape used to be matched, so `--account work` fell through to the
+# positional bucket: the account was silently ignored (the session launched under
+# the DEFAULT account) and the stray `--account` was handed to `claude`, which has
+# no such flag. Launching under the wrong account is a data-safety bug, not a
+# cosmetic one — so a value-taking option with nothing after it is now a hard
+# error rather than something quietly reinterpreted as a positional.
+#
+# Deliberately excludes claude's own value flags (--model, --agent, --session-id):
+# those must reach claude untouched, which is why this list is explicit and not
+# "anything that looks like a flag".
+_CS_VALUE_FLAGS=" --handoff --mode --account --to --from --limit --chat --every --daily-at --once --timeout --cwd --at --in "
+_norm=()
+while (( $# )); do
+  if [[ -n "$1" && "$_CS_VALUE_FLAGS" == *" $1 "* ]]; then
+    [[ $# -ge 2 ]] || { echo "claude-session: $1 requires a value (e.g. $1=VALUE or $1 VALUE)" >&2; exit 2; }
+    _norm+=("$1=$2"); shift 2; continue
+  fi
+  _norm+=("$1"); shift
+done
+set -- "${_norm[@]+"${_norm[@]}"}"
+
 ARGS=()
 for a in "$@"; do
   case "$a" in
@@ -1308,7 +1332,10 @@ for a in "$@"; do
     *)            ARGS+=("$a") ;;
   esac
 done
-set -- "${ARGS[@]:-}"
+# `"${ARGS[@]:-}"` expands to one EMPTY argument when ARGS is empty, which makes
+# $# read 1 for a bare `claude-session`. Use the +alternate form so empty really
+# means zero arguments.
+set -- "${ARGS[@]+"${ARGS[@]}"}"
 a1="${1:-}"; a2="${2:-}"
 
 case "$CLAUDE_MODE" in
@@ -1389,7 +1416,22 @@ _dispatch_native() {
   local dir; dir="$(pwd)"
   local sbase; sbase="$(basename "$dir")"; sbase="${sbase//[.:]/_}"
   local sess="$sbase-claude$ACCOUNT_SUFFIX"
-  if tmux has-session -t "$sess" 2>/dev/null; then _enter_session "$sess"; fi
+  # A session already running under this name does NOT mean the request is
+  # satisfied. The caller asked for something specific — `--resume <sid>`,
+  # `--continue`, a model override — and attaching to a pre-existing session
+  # delivers none of it. This used to call _enter_session here, which execs and
+  # therefore discarded every native argument without a word: you asked to
+  # resume one chat and silently landed in whatever chat happened to be open in
+  # this directory. Since the session name is just the cwd basename, any earlier
+  # session in the same directory hijacked the request.
+  #
+  # Give the request its own session instead, and say where it went.
+  if tmux has-session -t "$sess" 2>/dev/null; then
+    local base="$sess" n=2
+    while tmux has-session -t "$sess" 2>/dev/null; do sess="$base-$n"; n=$((n + 1)); done
+    printf "claude-session: '%s' is already running — opening this request as '%s'\n" "$base" "$sess" >&2
+    printf "  to attach to the existing one instead:  tmux attach -t %s\n" "$base" >&2
+  fi
   _launch_native "$sess" "$dir" "$acct_dir" -- "${nargs[@]+"${nargs[@]}"}"
 }
 

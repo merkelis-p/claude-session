@@ -76,9 +76,13 @@ _ti_load() {
     # meaning of would be the one failure mode this cache must not have.
     TI_STATE="cold"; return 0
   fi
-  local line k p m sz src title stale
-  while IFS= read -r line; do
-    IFS=$'\t' read -r stale p m sz src title <<<"$line"
+  local k p m sz src title stale
+  # Split on the tab directly in the loop's own `read`. The two-stage form this
+  # replaced (`read -r line` then `read <<<"$line"`) built a HERESTRING per line,
+  # which bash implements with a temp file — measured at ~1.4s for `doctor` on a
+  # 6810-entry index versus ~0.4s here, for identical parsing. Overflow behaviour
+  # is unchanged: extra embedded tabs still land in the last variable only.
+  while IFS=$'\t' read -r stale p m sz src title; do
     # The summary row (always last) carries the skipped-line count in the `p`
     # slot and a sentinel of "END" where a real row would have "0" or "1" —
     # `stale` is first specifically so an overflowed title (extra embedded

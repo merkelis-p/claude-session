@@ -1401,10 +1401,13 @@ PLAIN=0
 REAP=0
 SHOW_VERSION=0
 JSON_OUT=0; DRY_RUN=0; ASSUME_YES=0; ACK_DIGESTS=""
-SCHED_WORK=""; SCHED_DAYS=""; SCHED_MIGRATE=0; SCHED_FROM_NOW=0
+SCHED_WORK=""; SCHED_DAYS=""; SCHED_TZ=""; SCHED_MIGRATE=0; SCHED_FROM_NOW=0
 QUOTA_RESET_AT=""; QUOTA_SOURCE=""; QUOTA_CLEAR=0
-UI_PLACE=""; SNAP_ONLY=""; CHAT_LIMIT=50
-COPY_GET=0
+# CHAT_LIMIT is 200, not 50: once titles come from the persisted index, a window
+# costs one pass over that index rather than one tail+jq per row, so the window
+# is bounded by row-building cost instead of by I/O.
+UI_PLACE=""; SNAP_ONLY=""; SNAP_SIDS=""; CHAT_LIMIT=200
+CLIP_GET=0; CLIP_KEEP=0; TI_REBUILD=0
 HANDOFF=""
 CLAUDE_MODE="interactive"
 ACCOUNT=""
@@ -1429,7 +1432,7 @@ SCHED_AT=""; SCHED_IN=""
 # Deliberately excludes claude's own value flags (--model, --agent, --session-id):
 # those must reach claude untouched, which is why this list is explicit and not
 # "anything that looks like a flag".
-_CS_VALUE_FLAGS=" --handoff --mode --account --to --from --limit --chat --every --daily-at --once --timeout --cwd --at --in --ack --work --days --reset-at --place --only --limit-chats "
+_CS_VALUE_FLAGS=" --handoff --mode --account --to --from --limit --chat --every --daily-at --once --timeout --cwd --at --in --ack --work --days --tz --reset-at --place --only --sids --limit-chats "
 _norm=()
 while (( $# )); do
   if [[ -n "$1" && "$_CS_VALUE_FLAGS" == *" $1 "* ]]; then
@@ -1462,7 +1465,14 @@ for a in "$@"; do
     --place=*)      UI_PLACE="${a#*=}" ;;
     --only=*)       SNAP_ONLY="${a#*=}" ;;
     --limit-chats=*) CHAT_LIMIT="${a#*=}" ;;
-    --get)          COPY_GET=1 ;;
+    --sids=*)       SNAP_SIDS="${a#*=}" ;;   # the window `_titles` resolves
+    --rebuild)      TI_REBUILD=1 ;;          # the one full title-index build
+    --get)          CLIP_GET=1 ;;            # read the fallback clipboard buffer
+    --keep)         CLIP_KEEP=1 ;;           # --get without clearing the buffer
+    # The named timezone a wall-clock schedule is anchored to. An unzoned
+    # OnCalendar is read in the SYSTEM zone, which on this host means a working
+    # day typed as 09:00 fires at 12:00 local — a plausible-looking wrong answer.
+    --tz=*)         SCHED_TZ="${a#*=}" ;;
     # -p means --plain for own verbs; for native routing it's re-injected as
     # claude's --print alias at the native fall-through dispatch (never in ARGS,
     # so own-verb dispatch stays clean: `kill -p` → cmd_kill, `-p kill` → own kill).

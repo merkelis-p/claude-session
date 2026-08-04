@@ -122,6 +122,7 @@ set -euo pipefail
 . "$CLAUDE_HELPERS_LIB/titles.sh"
 . "$CLAUDE_HELPERS_LIB/ledger.sh"
 . "$CLAUDE_HELPERS_LIB/schedule.sh"
+. "$CLAUDE_HELPERS_LIB/json.sh"
 
 # ---- account registry -------------------------------------------------------
 # ~/.config/claude-helpers/accounts.conf registers extra Claude Code accounts,
@@ -186,7 +187,9 @@ _all_accounts() {
 # Verbs whose --json emitter exists in this build. Appended to as each emitter
 # lands. --json for anything else is a hard error: answering a --json request
 # with the human box-drawn rendering would be a silently-wrong answer.
-_JSON_READY_VERBS=""
+# "accounts" covers `accounts ls --json` (lib/json.sh's _json_section_accounts);
+# "_snapshot" is the internal envelope verb, also from lib/json.sh.
+_JSON_READY_VERBS="accounts _snapshot"
 _json_guard() {
   local verb="${1:-<none>}"
   (( JSON_OUT == 1 )) || return 0
@@ -1260,6 +1263,15 @@ cmd_doctor() {
 cmd_accounts() {
   local sub="${1:-ls}"
   shift || true
+  # _JSON_READY_VERBS gates by verb ("accounts"), not by subcommand — add/rm
+  # have no emitter here (only `ls` does, via lib/json.sh). Without this,
+  # `accounts add --json` would pass the top-level guard and then silently run
+  # its ordinary interactive/human path, discarding the --json request instead
+  # of erroring on it.
+  if (( JSON_OUT == 1 )) && [[ "$sub" != "ls" ]]; then
+    echo "claude-session: --json is not available for 'accounts $sub' in this build" >&2
+    exit 2
+  fi
   case "$sub" in
     add) cmd_accounts_add "$@" ;;
     ls)  cmd_accounts_ls ;;
@@ -1303,6 +1315,7 @@ HEADER
 }
 
 cmd_accounts_ls() {
+  if (( JSON_OUT == 1 )); then _json_section_accounts; return 0; fi
   box_top "Claude accounts"
   local first=1
   while IFS=$'\t' read -r name dir; do
@@ -1601,6 +1614,7 @@ case "$a1" in
   transfer) cmd_transfer "${@:2}"; _transfer_maybe_launch; exit 0 ;;
   schedule)      cmd_schedule "${@:2}"; exit 0 ;;
   _schedule-run) cmd_schedule_run "$a2"; exit $? ;;
+  _snapshot) cmd_snapshot; exit $? ;;   # internal: one envelope per poll cycle, for the app (lib/json.sh)
   _preview) _preview_for_sid "$a2" "${3:-}" "$(_account_dir_or_default "${4:-default}")"; exit 0 ;;   # internal: fzf preview hook (sid, cwd, account)
   kill)
     if [[ -z "$a2" ]]; then cmd_kill; else tmux kill-session -t "$a2"; fi

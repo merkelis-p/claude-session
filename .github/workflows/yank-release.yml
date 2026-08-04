@@ -1,0 +1,165 @@
+name: Yank release
+
+# install.sh's curl-pipe install path resolves GitHub's "latest" release, so a
+# bad release does not just sit there unused — it keeps installing itself onto
+# every new machine until the release metadata changes. Yanking therefore has
+# to do three specific things, not just "delete it":
+#
+#   1. mark it a prerelease, so GitHub's "latest" moves back to the previous
+#      good release automatically;
+#   2. delete the binary assets, so a client holding a stale SHA256SUMS entry
+#      can never satisfy the checksum by re-downloading the yanked binary;
+#   3. leave the git tag in place, so `git tag`/`git log` history is not
+#      rewritten and the record of what once existed stays honest.
+#
+# Shares release.yml's concurrency group so a yank can never interleave with
+# an in-flight release of the same (or any other) version.
+#
+#   gh workflow run "Yank release" -f tag=v0.2.0 -f confirm_tag=v0.2.0 \
+#     -f reason="binary segfaults on darwin/arm64, see #NN"
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact tag to yank, e.g. v0.2.0
+        required: true
+        type: string
+      reason:
+        description: Why this release is being yanked (goes into the release notes and CHANGELOG.md)
+        required: true
+        type: string
+      confirm_tag:
+        description: Re-type the tag exactly to confirm — must match "tag"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: claude-session-release
+  cancel-in-progress: false
+
+# Every `run:` step uses an explicit `shell: bash`, which GitHub Actions maps to
+# `bash --noprofile --norc -eo pipefail {0}`. Without this the default is
+# `bash -e {0}` with NO pipefail, and a step like `run-tests.sh | tee log` would
+# report the exit status of `tee` — i.e. green on a failing suite. Do not remove.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  yank:
+    name: Yank ${{ inputs.tag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Validate inputs
+        # Bind the raw inputs via env: before touching them — at this point
+        # `reason` in particular is still arbitrary, unvalidated, human-typed
+        # text, so it must never be spliced directly into a shell script (a
+        # value containing `"; ...; "` could otherwise break out of the
+        # quoting). An env var can't do that. Same pattern release.yml uses.
+        env:
+          TAG: ${{ inputs.tag }}
+          REASON: ${{ inputs.reason }}
+          CONFIRM_TAG: ${{ inputs.confirm_tag }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag must look like v0.2.0, got: $TAG" >&2
+            exit 1
+          fi
+          if [ -z "$REASON" ]; then
+            echo "reason must not be empty" >&2
+            exit 1
+          fi
+          # Explicit confirmation: re-typing the tag is one deliberate extra
+          # keystroke against yanking the wrong release off habit/autofill —
+          # this is a destructive, hard-to-fully-undo action (assets are
+          # deleted, not just hidden), so it gets its own confirmation input
+          # rather than relying on the workflow_dispatch UI alone.
+          if [ "$CONFIRM_TAG" != "$TAG" ]; then
+            echo "confirm_tag (\"$CONFIRM_TAG\") does not match tag (\"$TAG\") — refusing to yank." >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v6
+
+      - name: Verify the release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release view "$TAG" >/dev/null
+
+      - name: Mark as prerelease and prepend the YANKED notice
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REASON: ${{ inputs.reason }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          tag="$TAG"
+          old_notes="$(gh release view "$tag" --json body -q .body)"
+          {
+            echo "**YANKED: $REASON**"
+            echo
+            echo "\"latest\" now points at the previous release. The binary assets below have been removed — do not trust a cached checksum for this tag."
+            echo
+            echo "---"
+            echo
+            echo "$old_notes"
+          } > /tmp/notes.md
+          gh release edit "$tag" --prerelease --notes-file /tmp/notes.md
+
+      - name: Delete the release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          tag="$TAG"
+          assets="$(gh release view "$tag" --json assets -q '.assets[].name')"
+          if [ -z "$assets" ]; then
+            echo "no assets attached to $tag — nothing to delete (a bash-only release has none)."
+          fi
+          while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            echo "deleting asset: $name"
+            gh release delete-asset "$tag" "$name" --yes
+          done <<<"$assets"
+
+      # The tag itself is never touched: no `git tag -d`, no `git push
+      # --delete`. Only the release metadata (prerelease flag, notes, assets)
+      # changes.
+      - name: Record the yank in CHANGELOG.md via a pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REASON: ${{ inputs.reason }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          tag="$TAG"
+          branch="yank/${tag}-$(date +%s)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+
+          printf '## YANKED: %s — %s\n\n%s\n\n' "$tag" "$(date -u +%Y-%m-%d)" "$REASON" > /tmp/yank-note.md
+
+          # Splice the note in right before the first "## [" release entry, so
+          # it lands under the "# Changelog" preamble rather than above it.
+          awk -v notefile=/tmp/yank-note.md '
+            !inserted && /^## \[/ {
+              while ((getline line < notefile) > 0) print line
+              inserted = 1
+            }
+            { print }
+          ' CHANGELOG.md > /tmp/CHANGELOG.new
+          mv /tmp/CHANGELOG.new CHANGELOG.md
+
+          git add CHANGELOG.md
+          git commit -m "docs: record yank of $tag"
+          git push origin "$branch"
+          gh pr create \
+            --title "docs: record yank of $tag" \
+            --body "Automated by the yank-release workflow. Reason: $REASON" \
+            --base main \
+            --head "$branch"

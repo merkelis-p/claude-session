@@ -1,0 +1,236 @@
+name: CI
+
+# CI runs on a pull request to main, or when a human asks for it — never on
+# every push. Development happens across several parallel agent lanes and
+# each pushes every commit; CI on all of that would be pure waste. The local
+# gate is the fast feedback loop:
+#
+#   bash tests/run-tests.sh
+#
+# Run CI by hand (works from a phone):
+#   gh workflow run CI --ref work/<lane>
+#   gh run watch
+#
+# (Same reasoning as the equivalent gate in this maintainer's other repos —
+# see docs/releasing.md for the full writeup of what was carried over here
+# and why.)
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or SHA to check (defaults to the selected ref)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Every `run:` step uses an explicit `shell: bash`, which GitHub Actions maps to
+# `bash --noprofile --norc -eo pipefail {0}`. Without this the default is
+# `bash -e {0}` with NO pipefail, and a step like `run-tests.sh | tee log` would
+# report the exit status of `tee` — i.e. green on a failing suite. Do not remove.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bash-suite:
+    name: Bash suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      # ---- dependencies ------------------------------------------------------
+      # jq and tmux are hard dependencies (install.sh's own REQUIRED_DEPS list).
+      # ubuntu-latest ships jq but not tmux; don't assume either and just check.
+      - name: Install missing dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          missing=""
+          command -v jq   >/dev/null 2>&1 || missing="$missing jq"
+          command -v tmux >/dev/null 2>&1 || missing="$missing tmux"
+          if [ -n "$missing" ]; then
+            sudo apt-get update
+            sudo apt-get install -y $missing
+          fi
+          jq --version
+          tmux -V
+
+      # ---- bash 3.2 vs 4+ on macOS --------------------------------------------
+      # Two DIFFERENT claims need testing here, and they are not the same claim:
+      #
+      #   1. install.sh must run cleanly under the *stock* macOS bash (3.2) far
+      #      enough to print "you need bash >= 4" instead of dying on an opaque
+      #      syntax error. This is install.sh's own documented contract (see its
+      #      header comment) — it is the one file in this repo that must work
+      #      before a real bash exists on the machine at all.
+      #   2. Everything else (bin/claude-session, lib/*.sh, the test suite)
+      #      REQUIRES bash >= 4 (`declare -A`) and always has. Running that under
+      #      stock 3.2 would prove nothing we don't already know (it can't even
+      #      parse the file) — README ("Platform support") already tells real
+      #      macOS users to `brew install bash` first. So the application suite
+      #      runs under a Homebrew-installed bash, matching what a real user is
+      #      documented to have, not what Apple ships in the box.
+      #
+      # Order matters: this check runs BEFORE Homebrew's bash is installed, so
+      # `command -v bash` inside install.sh can only find the stock one — it
+      # actually exercises the guard's failure path, not just a syntax check.
+      - name: Verify install.sh degrades cleanly under stock bash 3.2 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "system /bin/bash reports version: $(/bin/bash -c 'echo ${BASH_VERSINFO[0]}')"
+          set +e
+          out="$(PATH="/usr/bin:/bin" /bin/bash install.sh --dry-run 2>&1)"
+          ec=$?
+          set -e
+          echo "$out"
+          if [ "$ec" -eq 0 ]; then
+            echo "install.sh exited 0 under stock bash 3.2. Either this image's" >&2
+            echo "/bin/bash is no longer 3.2 (update the comment above and this" >&2
+            echo "check), or the bash>=4 guard in install.sh silently stopped" >&2
+            echo "firing — an opaque failure for a real user on a fresh Mac." >&2
+            exit 1
+          fi
+          if ! grep -q 'needs bash >= 4' <<<"$out"; then
+            echo "install.sh failed under bash 3.2, but not with the expected" >&2
+            echo "'needs bash >= 4' guidance — likely a real syntax error, which" >&2
+            echo "is exactly the opaque failure this script exists to avoid." >&2
+            exit 1
+          fi
+
+      - name: Install a modern bash, jq, tmux (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash jq tmux
+          echo "bash now resolves to: $(command -v bash)"
+          bash -c 'echo "  version ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"'
+
+      # ---- syntax check --------------------------------------------------------
+      - name: Syntax-check every shipped script
+        run: |
+          bash -n install.sh
+          bash -n uninstall.sh
+          bash -n bin/claude-session
+          for f in lib/*.sh; do bash -n "$f"; done
+
+      # ---- the suite itself -----------------------------------------------------
+      # `tee` here is only safe because of the workflow-level `defaults.run.shell:
+      # bash` above, which is what actually turns on pipefail. Actions' DEFAULT
+      # shell is `bash -e {0}` with no pipefail — under that, this pipeline would
+      # report `tee`'s exit status and CI would go green on a failing suite. If
+      # that defaults block is ever removed, this step silently stops checking
+      # anything. Do not swallow the real exit code behind `tee`.
+      - name: Run the bash test suite
+        run: |
+          bash --version | head -1
+          bash tests/run-tests.sh 2>&1 | tee /tmp/run-tests.out
+
+      # ---- expected-skip allowlist (macOS only) ---------------------------------
+      # tests/run-tests.sh already prints which checks were SKIPped, because a
+      # skip reads exactly like a pass in a green summary (its own comment,
+      # tests/run-tests.sh:16-18). That protects a human reading the log. This
+      # step protects CI itself on the one platform where an invisible skip
+      # would be most dangerous: this is macOS's FIRST real run, so a silently
+      # new skip here would look identical to "everything passed."
+      #
+      # Every SKIP line ever seen on macOS goes in the `printf` list below,
+      # each with a one-line reason. Any SKIP text NOT in that list fails this
+      # job.
+      #
+      # HOW TO UPDATE: when a new skip shows up in a macOS CI run, read the log,
+      # decide whether it is a genuine, expected gap (host state, not a real
+      # platform bug) — then paste its EXACT text into the `printf` list with a
+      # reason. Never add a line to make CI green without having seen it appear
+      # for a real, understood reason.
+      - name: Check for unexpected skips (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          printf '%s\n' \
+            'SKIP: no process with a space in its comm exists on this host right now — cannot verify spaced-comm preservation' \
+            'SKIP: ls reported no sessions — liveness check not exercised on this host' \
+            'SKIP: no orphans on this host — orphan-row formatting not exercised' \
+            > /tmp/expected-skips-macos.txt
+          actual="$(grep 'SKIP:' /tmp/run-tests.out | sed -E 's/^[[:space:]]*//' | sort -u)"
+          if [ -z "$actual" ]; then
+            echo "no skips reported on this run — nothing to check against the allowlist."
+            exit 0
+          fi
+          echo "skips reported by this run:"
+          echo "$actual" | sed 's/^/  /'
+          unexpected=""
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if ! grep -qxF "$line" /tmp/expected-skips-macos.txt; then
+              unexpected="$unexpected$line
+          "
+            fi
+          done <<<"$actual"
+          if [ -n "$unexpected" ]; then
+            echo "" >&2
+            echo "unexpected skip(s) on macOS — not in the allowlist above:" >&2
+            echo "$unexpected" | sed 's/^/  /' >&2
+            echo "" >&2
+            echo "if this is a genuine, understood gap (not a silently-reduced" >&2
+            echo "check), add its exact text to the heredoc in this step with a" >&2
+            echo "reason. Do not add it just to make CI pass." >&2
+            exit 1
+          fi
+
+# ---------------------------------------------------------------------------
+# NOT YET ENABLED: Go / TUI jobs.
+#
+# tui/ does not exist in this repository yet (§13 of the TUI design spec
+# describes the target CI once it does). Adding `go`/`go-macos`/`contract`
+# jobs now would reference a module, test files, and a schema-version pair
+# that do not exist, so they would fail on every run for a reason that has
+# nothing to do with the change being tested. Once `tui/go.mod` lands, add a
+# job shaped like this (and see release.yml, which self-enables its Go build
+# the same way, off `tui/go.mod`'s presence, with no manual flag to flip):
+#
+#   go:
+#     name: Go suite (ubuntu)
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v6
+#       - uses: actions/setup-go@v5
+#         with: { go-version-file: tui/go.mod }
+#       - run: go vet ./...
+#         working-directory: tui
+#       - run: go test -race ./...
+#         working-directory: tui
+#       - run: go build ./...
+#         working-directory: tui
+#
+#   go-macos:
+#     name: Go suite (macos, native darwin/arm64)
+#     runs-on: macos-latest
+#     steps: # same as above — this is what proves darwin/arm64 without
+#            # cross-compilation, same reasoning as the bash-macos job.
+#
+#   contract:
+#     name: Cross-language contract tests
+#     runs-on: ubuntu-latest
+#     steps:
+#       - run: bash tests/test_json.sh
+#       - run: bash tests/test_tui_contract.sh
+#       - name: bash/Go schema-version must agree
+#         run: |
+#           bash_v="$(grep -o 'JSON_SCHEMA_VERSION=[0-9]*' bin/claude-session)"
+#           go_v="$(grep -o 'schemaMax[^0-9]*[0-9]*' tui/cmd/claude-session-tui/main.go)"
+#           # ... compare the two, fail on skew.

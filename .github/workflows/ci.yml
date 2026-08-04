@@ -192,36 +192,72 @@ jobs:
             exit 1
           fi
 
+  # The Go half runs on BOTH platforms for the same reason the bash suite does:
+  # layout measures grapheme clusters and terminal cell widths, and that is
+  # exactly the kind of code that passes on one libc/arch and not the other.
+  # macos-latest is arm64, so this is native darwin/arm64 coverage without any
+  # cross-compilation.
+  #
+  # No `if:` guard on tui/ existing: it is on main, so every PR branch has it.
+  #
+  # The toolchain is NOT named here. `go-version-file: tui/go.mod` makes that
+  # file the single pin, shared with release.yml — a hardcoded version here
+  # would be a second source that silently drifts from the one that ships.
+  go:
+    name: Go suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tui/go.mod
+
+      - name: gofmt must be clean
+        working-directory: tui
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt-clean:" >&2
+            echo "$unformatted" | sed 's/^/  /' >&2
+            echo "run: cd tui && make fmt" >&2
+            exit 1
+          fi
+
+      - name: go vet
+        working-directory: tui
+        run: go vet ./...
+
+      # CGO stays ENABLED here on purpose. The race detector is written in C, so
+      # `-race` fails outright under CGO_ENABLED=0 ("-race requires cgo"). The
+      # shipped binary is the static one — tui/Makefile scopes CGO_ENABLED=0 to
+      # its build/release targets, which is a different question from testing.
+      - name: go test -race
+        working-directory: tui
+        run: go test -race ./...
+
+      - name: go build
+        working-directory: tui
+        run: go build ./...
+
 # ---------------------------------------------------------------------------
-# NOT YET ENABLED: Go / TUI jobs.
+# NOT YET ENABLED: the cross-language contract job.
 #
-# tui/ does not exist in this repository yet (§13 of the TUI design spec
-# describes the target CI once it does). Adding `go`/`go-macos`/`contract`
-# jobs now would reference a module, test files, and a schema-version pair
-# that do not exist, so they would fail on every run for a reason that has
-# nothing to do with the change being tested. Once `tui/go.mod` lands, add a
-# job shaped like this (and see release.yml, which self-enables its Go build
-# the same way, off `tui/go.mod`'s presence, with no manual flag to flip):
+# It needs two things that do not exist yet: tests/test_tui_contract.sh, and
+# tui/cmd/claude-session-tui/main.go (which is where the Go side's accepted
+# schema range is declared). Adding the job now would fail every run for a
+# reason unrelated to the change being tested. tests/test_json.sh already
+# SKIPs — loudly, by name — the half of the cross-check that needs main.go, so
+# nothing here is silently unchecked in the meantime.
 #
-#   go:
-#     name: Go suite (ubuntu)
-#     runs-on: ubuntu-latest
-#     steps:
-#       - uses: actions/checkout@v6
-#       - uses: actions/setup-go@v5
-#         with: { go-version-file: tui/go.mod }
-#       - run: go vet ./...
-#         working-directory: tui
-#       - run: go test -race ./...
-#         working-directory: tui
-#       - run: go build ./...
-#         working-directory: tui
-#
-#   go-macos:
-#     name: Go suite (macos, native darwin/arm64)
-#     runs-on: macos-latest
-#     steps: # same as above — this is what proves darwin/arm64 without
-#            # cross-compilation, same reasoning as the bash-macos job.
+# Add it when the app shell lands:
 #
 #   contract:
 #     name: Cross-language contract tests

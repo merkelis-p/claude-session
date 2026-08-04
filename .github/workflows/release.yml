@@ -122,16 +122,23 @@ jobs:
             exit 1
           fi
 
-      # There is no Go binary to build yet — the TUI does not exist in this
-      # repository. This flag turns the build job on automatically the moment
-      # tui/go.mod is added at a released SHA; no edit to this workflow is
-      # needed. Until then, `build` below is skipped (not failed), and the
-      # release ships with no binary assets — see docs/releasing.md, "The Go
-      # build: today vs. after tui/ lands".
-      - name: Detect whether the Go TUI exists yet at this SHA
+      # This flag turns the build job on automatically once there is a binary to
+      # build at a released SHA; no edit to this workflow is needed. Until then,
+      # `build` below is skipped (not failed), and the release ships with no
+      # binary assets — see docs/releasing.md, "The Go build: today vs. after
+      # tui/ lands".
+      #
+      # The probe is the MAIN PACKAGE, not tui/go.mod. It used to be go.mod, and
+      # that was wrong: the module landed (with the pure layout package) well
+      # before cmd/claude-session-tui did, so `has_tui` flipped to true while
+      # `go build ./cmd/claude-session-tui` still had nothing to build — every
+      # release in that window would have failed in `build` for a reason
+      # unrelated to the release. go.mod remains the toolchain pin, which is a
+      # separate question from whether a binary exists.
+      - name: Detect whether the Go TUI binary exists yet at this SHA
         id: detect
         run: |
-          if [ -f tui/go.mod ]; then
+          if [ -d tui/cmd/claude-session-tui ]; then
             echo "has_tui=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_tui=false" >> "$GITHUB_OUTPUT"

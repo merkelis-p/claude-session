@@ -277,10 +277,37 @@ _enter_session() {
 
 
 
-# PID -> current RSS in MB (returns 0 if process is gone).
+# RSS(KB) batch cache: one `ps -eo pid=,rss=` for every pid on the box instead
+# of one `ps -p PID -o rss=` fork per row. `ls` calls _pid_ram_mb once per
+# session card, so this is the same "single snapshot, once per invocation"
+# idea as _ot_load in ui.sh (see its comment for why per-call caching, done
+# via a normal function call rather than through `$(...)`, is what actually
+# avoids the forks — a cache built inside a command-substitution subshell is
+# discarded the moment that subshell exits).
+# Only called from `cmd_ls`, a one-shot listing: `cmd_kill` is an open-ended
+# interactive loop, and freezing every RAM figure at the moment it started
+# would go stale while the user is still deciding — left alone on purpose.
+declare -A _RAM_KB_CACHE
+_RAM_LOADED=0
+_ram_load() {
+  (( _RAM_LOADED )) && return 0
+  local pid rss
+  while read -r pid rss; do
+    [[ -n "$pid" ]] && _RAM_KB_CACHE[$pid]="$rss"
+  done < <(ps -eo pid=,rss= 2>/dev/null || true)
+  _RAM_LOADED=1
+}
+
+# PID -> current RSS in MB (returns 0 if process is gone). Reads the batch
+# cache above when it has been loaded; otherwise falls back to a live per-pid
+# `ps` so this stays correct on its own for any caller that never loads it.
 _pid_ram_mb() {
   local rss
-  rss="$(ps -p "$1" -o rss= 2>/dev/null | tr -d ' ')"
+  if (( _RAM_LOADED )); then
+    rss="${_RAM_KB_CACHE[$1]:-}"
+  else
+    rss="$(ps -p "$1" -o rss= 2>/dev/null | tr -d ' ')"
+  fi
   [[ -z "$rss" ]] && echo 0 || awk -v r="$rss" 'BEGIN{printf "%.0f", r/1024}'
 }
 
@@ -506,8 +533,18 @@ _orphan_activity() {
 # ---- doctor checks ---------------------------------------------------------
 # Return value: array of warning lines, plus an exit-code summary.
 # Stdout = warnings (one per line, possibly colored); returns count via $?
+#
+# Optional $1 = pre-computed _session_rows output, for callers that already
+# scanned (cmd_ls, cmd_doctor) — skips a second full session-file scan. Falls
+# back to scanning itself when called with no argument, so this stays a safe
+# standalone call for anything else. Passing the STRING (not re-deriving it)
+# is what actually avoids the rescan: _session_rows always runs inside a
+# `$(...)` subshell, so any cache built *inside* it is discarded the instant
+# that subshell exits — only hoisting the one real scan into the caller's own
+# shell and handing the result down here works.
 _doctor_warnings() {
-  local rows; rows="$(_session_rows || true)"
+  local rows
+  if (( $# >= 1 )); then rows="$1"; else rows="$(_session_rows || true)"; fi
   local n=0
 
   # Checks (1)-(5) inspect Claude session-state JSON files, so they need at
@@ -658,8 +695,12 @@ _doctor_warnings() {
 # Per-pid: does it have any warning? Lightweight check used by `ls` to mark cards.
 declare -A PID_FLAG_TEXT
 
+# Optional $1 = pre-computed _session_rows output (see _doctor_warnings above
+# for why passing the string down, not re-deriving it, is what actually skips
+# the rescan). Falls back to scanning itself when called with no argument.
 _compute_pid_flags() {
-  local rows; rows="$(_session_rows || true)"
+  local rows
+  if (( $# >= 1 )); then rows="$1"; else rows="$(_session_rows || true)"; fi
   [[ -z "$rows" ]] && return
 
   # (cwd, account) dup-only-some-bridged → flag all non-bridged PIDs in that
@@ -715,8 +756,9 @@ cmd_ls() {
     return
   fi
 
-  _compute_pid_flags
+  _compute_pid_flags "$rows"
   _ledger_provenance_load
+  _ram_load
 
   box_top "Claude sessions"
   local first=1 i=0
@@ -771,7 +813,7 @@ cmd_ls() {
 
   # Warnings summary (compact)
   local warn_count
-  warn_count="$(_doctor_warnings | wc -l || true)"
+  warn_count="$(_doctor_warnings "$rows" | wc -l || true)"
   if (( warn_count > 0 )); then
     printf '%b %d warning(s) — run: %bclaude-session doctor%b\n' \
       "$GLYPH_ALERT" "$warn_count" "$BOLD" "$N"
@@ -1146,13 +1188,26 @@ _do_reap() {
 
 # ---- doctor ----------------------------------------------------------------
 cmd_doctor() {
-  local out; out="$(_doctor_warnings || true)"
+  # Scan once, hand the result down — _doctor_warnings used to rescan on its
+  # own, and the "all clear" branch below rescanned yet again just to print a
+  # count. Same string both times, so this is not merely faster but strictly
+  # more consistent: one snapshot for the whole `doctor` run.
+  local rows; rows="$(_session_rows || true)"
+  local out; out="$(_doctor_warnings "$rows" || true)"
   local count
   if [[ -z "$out" ]]; then count=0; else count="$(wc -l <<<"$out")"; fi
 
   box_top "Doctor"
   if (( count == 0 )); then
-    box_msg "$GLYPH_CHECK " "all clear ($(_session_rows | wc -l) session(s) checked)"
+    # `_session_rows | wc -l` (the original form) counted newlines straight
+    # off the pipe. `$rows` above already had its one trailing newline
+    # stripped by that command substitution, and `<<<"$rows"` adds exactly
+    # one back, so counting it this way lands on the identical number for
+    # every non-empty scan — except a truly empty one, where the herestring's
+    # own synthetic newline would otherwise be miscounted as one line.
+    local session_count=0
+    [[ -n "$rows" ]] && session_count="$(wc -l <<<"$rows")"
+    box_msg "$GLYPH_CHECK " "all clear ($session_count session(s) checked)"
   else
     # Each line from _doctor_warnings starts with a glyph (ANSI) followed by a space
     # and the message. Pass through box_msg for wrapping. Indented continuation

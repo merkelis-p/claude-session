@@ -3,6 +3,10 @@
 .DS_Store
 sdd-workspace/
 
+# Go build output (tui/Makefile writes per-platform binaries and SHA256SUMS
+# here). Also listed in tui/.gitignore, so it holds from either directory.
+tui/dist/
+
 # User data — must never be committed to this (public) repo.
 *.jsonl
 transfer-log.jsonl

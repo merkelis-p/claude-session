@@ -1,0 +1,12 @@
+# Build output (also ignored from the repo root, so a stray `cd tui && make`
+# cannot leak binaries into a commit from either working directory).
+dist/
+
+# Local test/profiling artifacts.
+*.test
+*.out
+coverage.*
+
+# NOTE: internal/layout/testdata/ is deliberately NOT ignored. When `go test
+# -fuzz` finds a crasher it writes the failing input there, and that input is
+# the regression test — it must be committed, not thrown away.

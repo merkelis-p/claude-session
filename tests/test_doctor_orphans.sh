@@ -119,4 +119,31 @@ assert_not_contains "$out" "would reap pid 100020" \
 assert_contains "$out" "would skip pid 100020" \
   "doctor --reap --force (fixture): lists the active orphan as skipped instead" || fail=1
 
+# ---- exit status IS the issue count (docs/doctor-orphans.md, "Exit status") ---
+# The whole point of that contract is `claude-session doctor; echo $?` in a
+# monitoring loop, with no output parsing. cmd_doctor used to fall off its own
+# end, so the status came from the last command to run (box_bottom) and was
+# ALWAYS 0 — a monitor read "all clear" while the box above printed six issues.
+# Asserting the two agree is what makes the contract checkable: comparing the
+# code against the printed "N issue(s) flagged" line means a future change
+# cannot move one without the other.
+export ORPHAN_PS_SRC="$FIXTURE"
+out="$("$CS" doctor 2>&1)"; rc=$?
+printed="$(grep -oE '[0-9]+ issue\(s\) flagged' <<<"$out" | grep -oE '^[0-9]+' || true)"
+if [[ -n "$printed" ]]; then
+  assert_eq "$rc" "$printed" "doctor's exit status equals the issue count it printed" || fail=1
+  # Guard against the assertion above passing for the wrong reason: if the
+  # fixture ever stopped producing issues, 0 == 0 would "pass" while proving
+  # nothing about a non-zero count.
+  if (( printed > 0 )); then
+    echo "PASS: the fixture produced $printed issue(s), so a non-zero status was actually exercised"
+  else
+    echo "FAIL: fixture produced no issues — the exit-status check could only compare 0 to 0" >&2; fail=1
+  fi
+else
+  # "all clear" is the other half of the same contract, not an untested case.
+  assert_contains "$out" "all clear" "no issue count printed, so doctor must have said all clear" || fail=1
+  assert_eq "$rc" "0" "doctor exits 0 when it reports all clear" || fail=1
+fi
+
 exit "$fail"

@@ -65,7 +65,17 @@ fi
 # real accounts, real tmux sessions — the actual environment `doctor`/`ls`
 # run against day to day, not a hermetic fixture.
 out="$("$CS" doctor 2>&1)"; ec=$?
-assert_eq "$ec" "0" "doctor exits 0 against the real process table" || fail=1
+# This used to assert `ec == 0`, which quietly encoded a BUG as the expectation:
+# cmd_doctor fell off its own end, so its status was always 0 regardless of what
+# it found, and 0 therefore proved nothing about whether the run succeeded. What
+# this check actually wants is "doctor ran to completion against the real process
+# table rather than dying", so compare its status against the count it printed —
+# the documented contract (docs/doctor-orphans.md, "Exit status"). A real crash
+# shows up as a status that does NOT match the printed count, which is what a
+# bash error (1), a usage error (2) or a missing command (127) would produce.
+printed="$(grep -oE '[0-9]+ issue\(s\) flagged' <<<"$out" | grep -oE '^[0-9]+' || true)"
+[[ -n "$printed" ]] || printed=0
+assert_eq "$ec" "$printed" "doctor's status matches its own issue count against the real process table" || fail=1
 assert_contains "$out" "Doctor" "doctor renders its box against real ps" || fail=1
 assert_not_contains "$out" "invalid option" "no getopt errors from a GNU-only ps invocation" || fail=1
 assert_not_contains "$out" "illegal option" "no BSD getopt errors either" || fail=1

@@ -1299,8 +1299,25 @@ cmd_doctor() {
   box_bottom
 
   if (( REAP == 1 )); then
+    # --reap has its own exit semantics (docs/doctor-orphans.md, "Exit status"):
+    # the issue-count contract below is for plain `doctor`, so the reap path's
+    # status is what propagates here.
     _do_reap
+    return $?
   fi
+
+  # docs/doctor-orphans.md promises: "`doctor` (without `--reap`) exits with the
+  # number of issues it found — 0 means all clear ... usable directly in scripts
+  # or a keepalive-adjacent monitoring loop without parsing its human-readable
+  # output." That was not true: this function simply fell off its end, so the
+  # status came from whatever ran last (box_bottom) and was always 0. A monitor
+  # polling `$?` therefore read "all clear" while the box above it printed six
+  # issues — the exact silent-success failure the contract exists to prevent.
+  #
+  # Clamped to 250: an exit status is one byte, so a raw count would wrap, and
+  # 256 issues reported as 0 would be that same lie again at the far end.
+  (( count > 250 )) && count=250
+  return "$count"
 }
 
 # ---- accounts subcommand ----------------------------------------------------

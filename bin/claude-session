@@ -180,33 +180,83 @@ _all_accounts() {
 # ---- session model ---------------------------------------------------------
 # Emit one TSV row per session file, across every registered account:
 #   tmux  pid  cwd  entry  status  sessionId  bridgeId  updatedMs  alive  account
+
+# The raw per-file fields, in the order _session_rows consumes them. Kept as its
+# own function so the fast batch path and the resilient per-file fallback below
+# emit byte-identical output from one field list rather than two copies that can
+# drift.
+# EVERY field must be non-empty. Tab is IFS *whitespace*, so bash collapses a
+# run of tabs into one delimiter: a single empty field silently shifts every
+# later field left. That produced rows where the sessionId column held a
+# timestamp, liveness flipped, and titles came from the wrong chat. The empty
+# placeholder is '-' and the shell converts it back where an empty string is
+# what the logic wants.
+# `//` only substitutes for null and false — an empty STRING passes straight
+# through it, which is how this shifted twice: first on a missing waitingFor,
+# then on a bridgeSessionId written as "". `def d` collapses both cases, so the
+# invariant "no field is ever empty" holds for every field by construction
+# rather than per-field vigilance.
+_SESSION_JQ='def d: if . == null or . == "" then "-" else . end;
+             [ (.pid|d), (.cwd|d), (.entrypoint|d), (.status|d),
+               (.waitingFor|d), (.sessionId|d), (.bridgeSessionId|d),
+               ((.statusUpdatedAt // .updatedAt // .startedAt // 0)
+                 | if . == null or . == "" then 0 else . end) ] | @tsv'
+
+_session_fields_per_file() {
+  local f
+  for f in "$@"; do
+    jq -r "$_SESSION_JQ" "$f" 2>/dev/null || true
+  done
+}
+
+# Emit one TSV row per session file, across every registered account:
+#   tmux  pid  cwd  entry  status  sessionId  bridgeId  updatedMs  alive  account
 _session_rows() {
   shopt -s nullglob
+  # Populate owner_tmux's lookup tables HERE, in this shell. Every owner_tmux
+  # call below happens inside `$(...)`, i.e. a subshell — a cache it builds is
+  # discarded when that subshell exits, so memoizing inside owner_tmux alone
+  # buys nothing (measured: forks fell but wall time did not move at all).
+  # Subshells inherit their parent's state, so loading once here is what
+  # actually makes the cache visible to all of them.
+  _ot_load
   local acct_name acct_dir
   while IFS=$'\t' read -r acct_name acct_dir; do
-    local f
-    for f in "$acct_dir/sessions"/*.json; do
-      local pid cwd entry status sid bid waitfor updated alive sess
-      pid="$(jq -r '.pid // empty' "$f" 2>/dev/null || true)"
-      [[ -z "$pid" ]] && continue
-      cwd="$(jq -r '.cwd // "-"' "$f")"
-      entry="$(jq -r '.entrypoint // "-"' "$f")"
-      status="$(jq -r '.status // "-"' "$f")"
-      waitfor="$(jq -r '.waitingFor // empty' "$f")"
+    local -a files=("$acct_dir/sessions"/*.json)
+    # nullglob means no session files expands to nothing — and `jq` with no file
+    # arguments reads STDIN, which would hang `ls` forever. Never let the glob
+    # reach jq empty.
+    (( ${#files[@]} )) || continue
+
+    # One jq per ACCOUNT, not eight per FILE. This previously forked jq once per
+    # field per file: 430 forks and ~6.5s of a 6.8s `ls` on this host. It is the
+    # same anti-pattern as the per-pid `ps` fork that once made `ls` take 150s —
+    # fixed there, never checked for here.
+    local raw
+    if ! raw="$(jq -rs ".[] | $_SESSION_JQ" "${files[@]}" 2>/dev/null)"; then
+      # `jq -s` is all-or-nothing: one unparseable file would hide every session
+      # for the account. These files are written live by Claude Code, so a torn
+      # read is a real possibility — fall back to per-file so the damage stays
+      # local to the bad file instead of blanking the account.
+      raw="$(_session_fields_per_file "${files[@]}")"
+    fi
+
+    local pid cwd entry status waitfor sid bid updated alive sess
+    while IFS=$'\t' read -r pid cwd entry status waitfor sid bid updated; do
+      # '-' is the emitter's placeholder for "absent" (see _SESSION_JQ); turn it
+      # back into the empty string only where the logic below tests emptiness.
+      [[ "$pid" == "-" || -z "$pid" ]] && continue
+      [[ "$waitfor" == "-" ]] && waitfor=""
       [[ "$status" == "waiting" && -n "$waitfor" ]] && status="waiting:$waitfor"
-      # Default to "-" so consecutive tabs don't collapse in downstream `read`.
-      sid="$(jq -r '.sessionId // "-"' "$f")"
-      bid="$(jq -r '.bridgeSessionId // "-"' "$f")"
       [[ -z "$sid" ]] && sid="-"
       [[ -z "$bid" ]] && bid="-"
-      updated="$(jq -r '.statusUpdatedAt // .updatedAt // .startedAt // 0' "$f")"
       if _proc_alive "$pid"; then alive=1; else alive=0; fi
       sess="$(owner_tmux "$pid")"
       [[ -z "$sess" && "$entry" == "claude-vscode" ]] && sess="(vscode)"
       [[ -z "$sess" ]] && sess="(detached)"
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$sess" "$pid" "$cwd" "$entry" "$status" "$sid" "$bid" "$updated" "$alive" "$acct_name"
-    done
+    done <<<"$raw"
   done < <(_all_accounts)
 }
 

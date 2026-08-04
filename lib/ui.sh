@@ -198,19 +198,45 @@ ms_relative() {
 }
 
 # Returns the tmux session that owns a given PID, by walking the ppid chain.
+# Both lookup tables are built once per process, not once per call. Callers
+# enumerate sessions in a loop (claude-session, remote-status, copilot-session),
+# so the un-memoized version forked `tmux list-panes` once per session plus a
+# `ps` for every step of every ancestor walk — 51 tmux and 93 ps forks in a
+# single `claude-session ls`.
+#
+# The cache is process-lifetime and deliberately not invalidated: every caller is
+# a one-shot listing command, and a table rebuilt mid-listing would make rows
+# inconsistent with each other rather than fresher. A long-lived caller that
+# needs a new snapshot should re-exec (or unset _OT_LOADED).
+_OT_LOADED=0
+declare -A _OT_PANE2SESS=()
+declare -A _OT_PID2PPID=()
+
+_ot_load() {
+  (( _OT_LOADED )) && return 0
+  local ppid sess pid
+  while IFS='|' read -r ppid sess; do
+    [[ -n "$ppid" ]] && _OT_PANE2SESS[$ppid]="$sess"
+  done < <(tmux list-panes -a -F '#{pane_pid}|#{session_name}' 2>/dev/null || true)
+  # One `ps` for the whole ancestry map, then walk it in-shell with zero forks.
+  while read -r pid ppid; do
+    [[ -n "$pid" ]] && _OT_PID2PPID[$pid]="$ppid"
+  done < <(ps -eo pid=,ppid= 2>/dev/null || true)
+  _OT_LOADED=1
+}
+
+# Returns the tmux session that owns a given PID, by walking the ppid chain.
 owner_tmux() {
   local pid="$1"
-  declare -A P2S
-  while IFS='|' read -r ppid sess; do
-    [[ -n "$ppid" ]] && P2S[$ppid]="$sess"
-  done < <(tmux list-panes -a -F '#{pane_pid}|#{session_name}' 2>/dev/null || true)
-  local cur="$pid"
+  _ot_load
+  local cur="$pid" hops=0
   while [[ -n "$cur" && "$cur" != "0" && "$cur" != "1" ]]; do
-    if [[ -n "${P2S[$cur]:-}" ]]; then echo "${P2S[$cur]}"; return; fi
-    # Step to the parent. `ps -o ppid=` works on both Linux and macOS, whereas
-    # /proc/<pid>/stat does not exist on macOS at all (which would make every
-    # session render as "(detached)" there).
-    cur="$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' ')"
+    if [[ -n "${_OT_PANE2SESS[$cur]:-}" ]]; then echo "${_OT_PANE2SESS[$cur]}"; return; fi
+    # Bound the walk: a pid->ppid map read at one instant can contain a cycle if
+    # pids were recycled mid-read, and an unbounded loop here would hang the
+    # caller instead of just returning "unknown".
+    (( ++hops > 64 )) && return
+    cur="${_OT_PID2PPID[$cur]:-}"
     [[ -n "$cur" ]] || return
   done
 }

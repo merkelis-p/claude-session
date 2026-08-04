@@ -14,10 +14,21 @@ _proj_dir_for_cwd() {
 _live_sids() {
   local acct_dir="${1:-$HOME/.claude}"
   shopt -s nullglob
-  local f s
-  for f in "$acct_dir/sessions"/*.json; do
-    s="$(jq -r '.sessionId // empty' "$f" 2>/dev/null)"
-    [[ -n "$s" ]] && echo "$s"
+  local -a files=("$acct_dir/sessions"/*.json)
+  # nullglob makes this empty when there are no session files, and `jq` with no
+  # file arguments reads STDIN — which would hang every caller.
+  (( ${#files[@]} )) || return 0
+  # One jq for all files instead of one per file. This was the single largest
+  # cost in `claude-session ls`: 154 of the 188 remaining jq forks, because the
+  # function is itself called several times per listing. Batching is what fixes
+  # it — memoizing would not, since every caller invokes this inside `$(...)`,
+  # and a cache built in that subshell dies with it.
+  jq -rs '.[] | .sessionId // empty' "${files[@]}" 2>/dev/null && return 0
+  # `jq -s` is all-or-nothing, so one torn write by Claude Code would blank the
+  # whole account. Degrade to per-file so only the bad file is lost.
+  local f
+  for f in "${files[@]}"; do
+    jq -r '.sessionId // empty' "$f" 2>/dev/null || true
   done
 }
 

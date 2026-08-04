@@ -1,10 +1,21 @@
 # shellcheck shell=bash
 # titleindex.sh — a persisted cache of chat titles, and nothing more.
 #
-# WHY: measured on this host, 6810 transcripts x ~35ms of title extraction is ~54s.
-# Batching the read (titles.sh) gets that to ~8ms each, which is still ~54s for the
-# whole set and ~400ms for a 50-row window — exactly the poll budget, with zero
-# headroom. So titles are cached, and a cache miss falls back lazily.
+# WHY: a full rebuild (_ti_rebuild — mtime + size + a title read, per
+# transcript, across every account) measures ~35-39ms per transcript,
+# hermetically, in a fake HOME with synthetic two-line transcripts (1,000
+# transcripts: 39.35s / 39.35ms each; 2,000: 71.33s / 35.66ms each — both runs
+# via the real CLI's `_titles --rebuild`). Linearly extrapolated to this
+# host's actual count, 6,810 transcripts, that is ~240s (~4 minutes) — not
+# the ~54s an earlier version of this comment claimed (that number was
+# simply the wrong side of a mis-multiplication, understating the real cost
+# by ~4-5x). titles.sh's batched `_title_read` alone (no mtime, no size, just
+# the read) is ~8ms in isolation — see its own header — but a full rebuild
+# also pays for `_file_mtime` and `wc -c` per transcript, which is where the
+# rest of the ~35ms comes from. Either way it's minutes, not tens of seconds,
+# for the whole account — so titles are cached, and a cache miss falls back
+# lazily. The read alone is what sets the WINDOW budget: ~8ms x 50 rows is
+# ~400ms — exactly the poll budget, with zero headroom.
 #
 # IT IS A CACHE. Deleting this file loses nothing: every entry can be recomputed
 # from the transcript it names. It therefore lives under XDG_CACHE_HOME, is never
@@ -127,9 +138,34 @@ _ti_load() {
       print "END", skipped+0, "", "", "", ""
     }
   ' "$TITLE_INDEX" 2>/dev/null || true)
+  # Precedence: corrupt (unparseable lines present) beats stale (compaction
+  # opportunity) beats an entries==0 index (nothing to serve — NOT "warm": a
+  # cache that cannot hit is the same over-claim as a check that never ran
+  # reporting PASS) beats warm.
+  #
+  # STALE threshold: hysteresis + an absolute floor, not a bare majority.
+  # Every message appends to a transcript, and every poll of a window
+  # containing it appends a fresh index line — a `stale > live` majority
+  # (the previous rule) is reached by the THIRD poll of the same handful of
+  # chats and never clears, so `doctor` flagged a perfectly healthy,
+  # perfectly-working cache as an ongoing issue within seconds of normal use.
+  # Two conditions now have to hold at once:
+  #   * stale is at least 3x live (TI_ENTRIES - TI_STALE) — dead weight has to
+  #     be the dominant shape of the file, not merely present, before a
+  #     ~141s-per-4000-transcript rebuild is worth recommending;
+  #   * AND at least 300 stale lines outright — a floor so a small, everyday
+  #     account (a handful of chats, edited a normal number of times) never
+  #     trips this on volume alone. 300 is small next to the reference host's
+  #     6,810-transcript index, but far above what ordinary day-to-day editing
+  #     of a handful of chats produces before a user would ever run `doctor`.
+  # Both numbers are chosen so the state is actionable ("this is worth a
+  # rebuild") rather than ambient ("this is always true of a cache that works
+  # exactly as designed").
   if (( TI_SKIPPED > 0 )); then
     TI_STATE="corrupt"
-  elif (( TI_STALE > (TI_ENTRIES - TI_STALE) )); then
+  elif (( TI_ENTRIES == 0 )); then
+    TI_STATE="cold"
+  elif (( TI_STALE >= 300 && TI_STALE > (TI_ENTRIES - TI_STALE) * 3 )); then
     TI_STATE="stale"
   else
     TI_STATE="warm"
@@ -183,12 +219,25 @@ _ti_lookup_window() {
 _ti_put() {
   local d; d="$(dirname "$TITLE_INDEX")"
   [[ -d "$d" ]] || { mkdir -p "$d" && chmod 700 "$d"; }
-  if [[ ! -f "$TITLE_INDEX" ]]; then
+  # Refuse to write through a symlink: this file is 0600 by intent, and following
+  # a swapped symlink would leak its contents somewhere else entirely. Checked
+  # BEFORE any write on purpose — `[[ -f ]]` below follows a symlink too (even
+  # a DANGLING one, which `-f` reports false for, but which the header-write
+  # below would then happily create AT THE TARGET before this refusal ever
+  # ran). The refusal has to be the first thing that can touch the path.
+  [[ -L "$TITLE_INDEX" ]] && { echo "claude-session: $TITLE_INDEX is a symlink — refusing to write the title cache" >&2; return 1; }
+  # Write a fresh header when there is no file OR its first line isn't ours.
+  # Both a 0-byte file (crash mid-write, disk full, `: >` truncation) and an
+  # unrecognized version are REPLACEABLE, not merely "no header, so cold
+  # forever": readers already treat anything under a mismatched/missing
+  # header as unreadable whole (see _ti_load / _ti_lookup_window), so nothing
+  # of value survives under it anyway — this heals the file the next time
+  # anything writes to it instead of leaving it permanently dead.
+  local hdr=""
+  [[ -f "$TITLE_INDEX" ]] && hdr="$(head -1 "$TITLE_INDEX" 2>/dev/null || true)"
+  if [[ ! -f "$TITLE_INDEX" || "$hdr" != "#v$TITLE_INDEX_VERSION "* ]]; then
     ( umask 077; printf '#v%s %s\n' "$TITLE_INDEX_VERSION" "$(date +%s)" > "$TITLE_INDEX" )
   fi
-  # Refuse to write through a symlink: this file is 0600 by intent, and following
-  # a swapped symlink would leak its contents somewhere else entirely.
-  [[ -L "$TITLE_INDEX" ]] && { echo "claude-session: $TITLE_INDEX is a symlink — refusing to write the title cache" >&2; return 1; }
   printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" >> "$TITLE_INDEX"
 }
 
@@ -197,7 +246,7 @@ _ti_put() {
 # one intact. No lock: `mv` is atomic, two concurrent builders means the loser's
 # work is lost, and losing cache work costs a re-read and nothing else.
 _ti_rebuild() {
-  local d tmp acct dir i f m sz r
+  local d tmp acct dir i f m sz r rc=0
   d="$(dirname "$TITLE_INDEX")"; [[ -d "$d" ]] || { mkdir -p "$d" && chmod 700 "$d"; }
   tmp="$(mktemp "$d/titles.tsv.tmp.XXXXXX")" || return 1
   chmod 600 "$tmp"
@@ -212,9 +261,36 @@ _ti_rebuild() {
       printf '%s\t%s\t%s\t%s\n' "$f" "$m" "${sz// /}" "$r" >> "$tmp"
     done
   done < <(_all_accounts)
-  mv -f "$tmp" "$TITLE_INDEX" && trap - RETURN
+  # Verify the outcome, don't just trust `mv`'s exit status: if $TITLE_INDEX is
+  # occupied by a directory, `mv "$tmp" "$TITLE_INDEX"` "succeeds" by nesting
+  # $tmp INSIDE that directory — rc=0, but $TITLE_INDEX is still a directory
+  # afterward, not the rebuilt file. `-f` on the destination path is the real
+  # check: it is false in exactly that case, so it becomes a reported failure
+  # instead of a silent no-op that later corrupts a JSON reply (a caller
+  # running `awk`/`wc` on a directory next).
+  if mv -f "$tmp" "$TITLE_INDEX" 2>/dev/null && [[ -f "$TITLE_INDEX" ]]; then
+    rc=0
+  else
+    rm -f "$tmp"
+    rc=1
+  fi
+  # Clear the trap on EVERY path, success or failure, before returning — not
+  # just after a successful `mv`. `trap ... RETURN` is not scoped to this
+  # function alone: left armed, it re-fires at the CALLER's own return, where
+  # `tmp` (a `local` to THIS function) no longer exists, and `set -u` turns
+  # that into "tmp: unbound variable" — an opaque abort of whatever called
+  # this, not a clean `return 1`. Latent today (the one caller is top-level,
+  # where there is no "caller's return" left to hit) but real for any future
+  # in-function caller, and free to fix unconditionally.
+  trap - RETURN
+  return "$rc"
 }
 
+# TI_HITS/TI_MISSES are process-lifetime counters of actual index consults:
+# `_ti_lookup` (single-key) and `_titles_window` (the window path every real
+# caller uses) both increment them. `_ti_load` itself never touches either —
+# loading the file isn't a lookup — so `_ti_stats` reports whatever this
+# process's callers actually did, not a count from a code path nothing calls.
 _ti_stats() { _ti_load; printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
   "$TI_STATE" "$TI_HITS" "$TI_MISSES" "$TI_ENTRIES" "$TI_DUPES" "$TI_SKIPPED" "$TI_STALE"; }
 
@@ -231,46 +307,129 @@ _ti_stats() { _ti_load; printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
 # for ONE awk pass over the index (see there), then do a second bounded pass
 # using the (at most window-sized) hash of matches. Cost is now proportional
 # to the window, never to the index.
+#
+# NO command substitution inside any per-sid or per-row loop below — that was
+# the actual defect in an earlier version of this function: it called
+# `_transcript_for_sid` (a `find` fork), `_file_mtime` (two more forks:
+# `_compat_os` -> `uname`, then `stat`) and `wc -c`, ALL per requested sid, so
+# a 100%-warm 50-sid window still cost 766ms and a 200-sid one 3936ms — both
+# far over the 400ms poll budget this cache exists to hit. Every step below
+# is either a single fork for the WHOLE window, or plain bash (parameter
+# expansion, array/hash indexing, arithmetic) with zero forks at all.
 _titles_window() {
   local acct_dir="$1"; shift
   local sid f m sz rows="" keys=""
-  local -a w_sid=() w_f=() w_m=() w_sz=()
+  local -a req_sids=()
   for sid in "$@"; do
     [[ -z "$sid" ]] && continue
-    f="$(_transcript_for_sid "$sid" "" "$acct_dir")"
-    if [[ -z "$f" || ! -f "$f" ]]; then
-      w_sid+=("$sid"); w_f+=(""); w_m+=(""); w_sz+=("")
-      continue
-    fi
-    m="$(_file_mtime "$f" 2>/dev/null || echo 0)"; sz="$(wc -c < "$f" 2>/dev/null || echo 0)"; sz="${sz// /}"
-    w_sid+=("$sid"); w_f+=("$f"); w_m+=("$m"); w_sz+=("$sz")
-    keys+="$f"$'\t'"$m"$'\t'"$sz"$'\n'
+    req_sids+=("$sid")
   done
 
-  # ONE awk fork for the whole window, regardless of window size (the "index
-  # is parsed once for the whole window" invariant) — not one fork per row and
-  # not a full-index bash loop.
+  # M12: `_ti_lookup_window`'s own contract (below) says "at most CHAT_LIMIT
+  # rows" — make that true here, once, rather than leaving the window
+  # unbounded. CHAT_LIMIT is bin/claude-session's `--limit-chats=` global
+  # (default 200); falls back to that default if unset (e.g. this file
+  # sourced standalone by a test).
+  local _tw_limit="${CHAT_LIMIT:-200}"
+  if (( ${#req_sids[@]} > _tw_limit )); then
+    req_sids=("${req_sids[@]:0:_tw_limit}")
+  fi
+
+  # ---- 1. sid -> path for the WHOLE window, in one pass, zero forks --------
+  # Every transcript that could match a requested sid lives at
+  # "$acct_dir/projects/<encoded-cwd>/<sid>.jsonl" — the same depth-2 shape
+  # _build_transfer_index (lib/ledger.sh) enumerates for the transfer picker.
+  # This is NOT a call to that function: it additionally forks `_file_mtime`
+  # (itself `_compat_os` -> `uname`, then `stat`) plus `basename`/`dirname`
+  # PER TRANSCRIPT IN THE WHOLE ACCOUNT, to sort the picker by recency — a
+  # cost this lookup has no use for (it doesn't care about ordering) and
+  # cannot afford to import into a poll's hot path. One bash glob loop, with
+  # the sid pulled out by parameter expansion, finds every requested sid in a
+  # single pass with no process spawned at all.
+  local -A want=() path_of=()
+  for sid in "${req_sids[@]}"; do want["$sid"]=1; done
+  if (( ${#want[@]} > 0 )); then
+    local remaining=${#want[@]} base
+    shopt -s nullglob
+    for f in "$acct_dir"/projects/*/*.jsonl; do
+      base="${f##*/}"; base="${base%.jsonl}"
+      if [[ -n "${want[$base]:-}" ]]; then
+        path_of["$base"]="$f"
+        unset "want[$base]"
+        remaining=$((remaining - 1))
+        (( remaining == 0 )) && break
+      fi
+    done
+  fi
+
+  # ---- 2. mtime + size for the WHOLE window in ONE `stat`, not one per row --
+  # A single `stat` call over every resolved path returns name, mtime and
+  # size together — no separate `wc -c` needed at all, on either OS.
+  local -a stat_files=()
+  for sid in "${req_sids[@]}"; do
+    [[ -n "${path_of[$sid]:-}" ]] && stat_files+=("${path_of[$sid]}")
+  done
+  local -A m_of=() sz_of=()
+  if (( ${#stat_files[@]} > 0 )); then
+    local sp sm ssz
+    while IFS=$'\t' read -r sp sm ssz; do
+      [[ -z "$sp" ]] && continue
+      m_of["$sp"]="$sm"; sz_of["$sp"]="$ssz"
+    done < <(
+      case "$(_compat_os)" in
+        darwin) stat -f $'%N\t%m\t%z' "${stat_files[@]}" 2>/dev/null ;;
+        *)      stat -c $'%n\t%Y\t%s' "${stat_files[@]}" 2>/dev/null ;;
+      esac
+    )
+  fi
+
+  for sid in "${req_sids[@]}"; do
+    f="${path_of[$sid]:-}"
+    [[ -n "$f" ]] && keys+="$f"$'\t'"${m_of[$f]:-0}"$'\t'"${sz_of[$f]:-0}"$'\n'
+  done
+
+  # ---- 3. ONE awk fork for the whole window against the index --------------
+  # (the "index is parsed once for the whole window" invariant) — not one
+  # fork per row and not a full-index bash loop. The single `read` below
+  # splits on the tab directly, same shape as _ti_load's fix (M11): no
+  # herestring, which bash would implement with a temp file per matched row.
   local -A hit=()
-  local line p m2 sz2 src title
+  local p m2 sz2 src title
   if [[ -n "$keys" ]]; then
-    while IFS= read -r line; do
-      IFS=$'\t' read -r p m2 sz2 src title <<<"$line"
+    while IFS=$'\t' read -r p m2 sz2 src title; do
       [[ -z "$p" ]] && continue
       hit["$p"$'\t'"$m2"$'\t'"$sz2"]="$src"$'\t'"$title"
     done < <(_ti_lookup_window "$keys")
   fi
 
-  local i n=${#w_sid[@]} r
-  for (( i = 0; i < n; i++ )); do
-    sid="${w_sid[$i]}"; f="${w_f[$i]}"; m="${w_m[$i]}"; sz="${w_sz[$i]}"
+  # ---- 4. build the rows: inline concatenation, never `$(...)` -------------
+  # `resolved` memoizes by PATH (not by sid) across this loop: a sid repeated
+  # in one window (or two concurrent polls hitting the same miss) used to read
+  # its transcript and `_ti_put` its resolved row once PER OCCURRENCE — two
+  # identical lines from one process, which `doctor` then reported as a
+  # duplicate forever, until a rebuild. Recording the row the first time a
+  # path is resolved and reusing it for every later occurrence in this same
+  # window fixes both the double read and the false alarm.
+  local -A resolved=()
+  local r
+  for sid in "${req_sids[@]}"; do
+    f="${path_of[$sid]:-}"
     if [[ -z "$f" ]]; then
-      rows+="$(printf '%s\tunknown\tnone\t' "$sid")"$'\n'; continue
+      rows+="$sid"$'\t'"unknown"$'\t'"none"$'\t'$'\n'; continue
     fi
-    r="${hit["$f"$'\t'"$m"$'\t'"$sz"]:-}"
+    m="${m_of[$f]:-0}"; sz="${sz_of[$f]:-0}"
+    r="${resolved[$f]:-}"
     if [[ -z "$r" ]]; then
-      r="$(_title_read "$f")"; _ti_put "$f" "$m" "$sz" "${r%%$'\t'*}" "${r#*$'\t'}" || true
+      r="${hit["$f"$'\t'"$m"$'\t'"$sz"]:-}"
+      if [[ -z "$r" ]]; then
+        TI_MISSES=$((TI_MISSES + 1))
+        r="$(_title_read "$f")"; _ti_put "$f" "$m" "$sz" "${r%%$'\t'*}" "${r#*$'\t'}" || true
+      else
+        TI_HITS=$((TI_HITS + 1))
+      fi
+      resolved["$f"]="$r"
     fi
-    rows+="$(printf '%s\tknown\t%s' "$sid" "$r")"$'\n'
+    rows+="$sid"$'\t'"known"$'\t'"$r"$'\n'
   done
   jq -Rn --argjson sv "$JSON_SCHEMA_VERSION" \
     '{schemaVersion:$sv, items: [inputs | select(length>0) | split("\t")

@@ -731,14 +731,28 @@ _doctor_warnings() {
 # here.
 _doctor_title_index() {
   _ti_load
+  # Present but unreadable/cold: the file EXISTS (so this isn't just "never
+  # built yet" — a brand-new install with no index at all is normal, not an
+  # issue) yet _ti_load bailed to cold — a 0-byte file (crash mid-write, disk
+  # full, a manual `: >` truncation) or an unrecognized version header, either
+  # way an index that cannot serve a single hit and was silently reporting
+  # nothing before this check existed. `_ti_put` heals it on the next write;
+  # this is what tells a user that write hasn't happened yet.
+  if [[ "$TI_STATE" == "cold" && -e "$TITLE_INDEX" ]]; then
+    printf '%b title index: present but unreadable/cold (missing or unrecognized version header) — run claude-session _titles --rebuild\n' \
+      "$GLYPH_ALERT"
+  fi
   (( TI_SKIPPED > 0 )) && printf '%b title index: %d unreadable line(s) — run claude-session _titles --rebuild\n' \
     "$GLYPH_ALERT" "$TI_SKIPPED"
   (( TI_DUPES > 0 )) && printf '%b title index: %d duplicate line(s) — run claude-session _titles --rebuild\n' \
     "$GLYPH_ALERT" "$TI_DUPES"
   # Append-only growth means every mtime/size change adds a line and nothing
   # ever compacts one away — TI_STALE lines are the dead weight from that.
-  # _ti_load already sets TI_STATE=stale once they outnumber live entries.
-  [[ "$TI_STATE" == "stale" ]] && printf '%b title index: stale — %d superseded line(s) outnumber %d live — run claude-session _titles --rebuild\n' \
+  # _ti_load already sets TI_STATE=stale once it clears both the hysteresis
+  # multiple AND the absolute floor (see the threshold comment in
+  # lib/titleindex.sh's _ti_load) — never on a bare majority, so this stays
+  # an actionable signal instead of firing on ordinary day-to-day use.
+  [[ "$TI_STATE" == "stale" ]] && printf '%b title index: stale — %d superseded line(s), more than 3x the %d live — run claude-session _titles --rebuild\n' \
     "$GLYPH_ALERT" "$TI_STALE" "$((TI_ENTRIES - TI_STALE))"
   return 0
 }
@@ -1659,16 +1673,31 @@ case "$a1" in
   _titles)
     (( JSON_OUT == 1 )) || { echo "claude-session _titles: requires --json" >&2; exit 2; }
     if (( TI_REBUILD == 1 )); then
-      # The ONLY full build. ~54s on this host for 6810 transcripts, so it is never
-      # reached from a listing path — a user waiting for a list must never wait for
-      # a cache. The app offers it as an explicit action that hands over the
+      # The ONLY full build. Measured (hermetic fake HOME, real CLI, synthetic
+      # two-line transcripts): 1,000 transcripts in 39.35s, 2,000 in 71.33s —
+      # ~35-39ms each. Linearly extrapolated to this host's actual 6,810
+      # transcripts, that's ~240s (~4 minutes), not the ~54s an earlier
+      # version of this comment claimed. Either way it is never reached from
+      # a listing path — a user waiting for a list must never wait for a
+      # cache. The app offers it as an explicit action that hands over the
       # terminal (Task 18), and install.sh only ever suggests it.
       _ti_rebuild || exit 1
       printf '{"schemaVersion":%s,"rebuilt":true,"entries":%s}\n' "$JSON_SCHEMA_VERSION" \
         "$(awk 'NR>1' "$TITLE_INDEX" | wc -l | tr -d ' ')"
       exit 0
     fi
-    _titles_window "$(_account_dir_or_default "${ACCOUNT:-default}")" ${SNAP_SIDS//,/ }
+    # `IFS=',' read -ra`, never a bare unquoted `${SNAP_SIDS//,/ }`: the latter
+    # is word-split AND glob-expanded, and this string comes straight off a
+    # CLI flag. A sid containing `*` (sids are UUIDs in practice, but nothing
+    # stops a caller from passing anything) would expand against the CURRENT
+    # DIRECTORY before `_titles_window` ever saw it, silently turning one
+    # requested sid into whatever unrelated filenames happened to match.
+    # `read -ra` splits on the comma without ever consulting pathname
+    # expansion, and produces an empty array (not one empty-string element)
+    # when $SNAP_SIDS is unset/empty, matching the previous no-flag behavior.
+    _tw_sids=()
+    IFS=',' read -ra _tw_sids <<< "$SNAP_SIDS"
+    _titles_window "$(_account_dir_or_default "${ACCOUNT:-default}")" "${_tw_sids[@]+"${_tw_sids[@]}"}"
     exit $? ;;
   kill)
     if [[ -z "$a2" ]]; then cmd_kill; else tmux kill-session -t "$a2"; fi

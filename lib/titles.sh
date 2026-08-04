@@ -114,6 +114,15 @@ _preview_for_sid() {
 # place a title is produced. The index is TSV, and a title containing a tab would
 # shift every later field — the identical bug class _SESSION_JQ's `def d` guards
 # against (a single empty field once put timestamps in the sessionId column).
+#
+# `join("\t")`, deliberately NOT `@tsv`: `@tsv` also escapes a literal
+# backslash by DOUBLING it (`\` -> `\\`), and the gsub above only ever
+# touches `\t \n \r` — so `@tsv` would be the only thing left to touch a
+# backslash, and it would corrupt every title that has one (e.g. a Windows
+# path in a `customTitle`) all the way into the transfer ledger, which is
+# persistent user data, not a cache. `join` does no escaping at all, which is
+# exactly safe here because the tabs/newlines/CRs that `@tsv` exists to
+# protect against are already squashed out by the gsub on the line above.
 _title_read() {
   local file="$1" out
   [[ -f "$file" ]] || { printf 'missing\t'; return 0; }
@@ -131,7 +140,7 @@ _title_pick_jq() {
        elif ($p|length)>0 then ["last-prompt",$p]
        else ["none","(untitled)"] end)
     | .[1] |= (gsub("[\t\n\r]"; " ") | gsub(" +"; " "))
-    | @tsv' 2>/dev/null || printf 'none\t(untitled)'
+    | join("\t")' 2>/dev/null || printf 'none\t(untitled)'
 }
 # Kept for every existing caller: same contract, same output, one third the cost.
 _title_for_file() {

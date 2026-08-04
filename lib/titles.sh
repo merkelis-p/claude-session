@@ -101,19 +101,44 @@ _preview_for_sid() {
 # custom-title record was added later and shares the same end-of-file tail-scan
 # shape as ai-title/last-prompt, so the 200/200 figure predates it but the same
 # reasoning covers it.
+#
+# One tail + one jq, returning "<source>\t<title>". Measured on this host: three
+# separate tail|jq chains 18ms, this 8ms, tail|grep 17ms (grep is SLOWER than jq
+# here) — so batching the three field reads is the same win as cutting the forks.
+#
+# `fromjson?` per line is what keeps the tolerance the old grep-based code got for
+# free: `tail -c` cuts mid-record, so the first line is routinely invalid JSON and
+# `jq -s` would fail the whole read. Unparseable lines are dropped, not guessed.
+#
+# Tabs, newlines and carriage returns are squashed to spaces HERE, at the only
+# place a title is produced. The index is TSV, and a title containing a tab would
+# shift every later field — the identical bug class _SESSION_JQ's `def d` guards
+# against (a single empty field once put timestamps in the sessionId column).
+_title_read() {
+  local file="$1" out
+  [[ -f "$file" ]] || { printf 'missing\t'; return 0; }
+  out="$(tail -c 262144 "$file" 2>/dev/null | _title_pick_jq)"
+  [[ "${out%%$'\t'*}" == "none" ]] && out="$(_title_pick_jq < "$file")"   # full-scan fallback
+  printf '%s' "$out"
+}
+_title_pick_jq() {
+  jq -Rrs 'split("\n") | map(fromjson? // empty)
+    | ( [.[] | select(.type=="custom-title") | .customTitle // empty] | last ) as $c
+    | ( [.[] | select(.type=="ai-title")     | .aiTitle     // empty] | last ) as $a
+    | ( [.[] | select(.type=="last-prompt")  | .lastPrompt  // empty] | last ) as $p
+    | (if   ($c|length)>0 then ["custom-title",$c]
+       elif ($a|length)>0 then ["ai-title",$a]
+       elif ($p|length)>0 then ["last-prompt",$p]
+       else ["none","(untitled)"] end)
+    | .[1] |= (gsub("[\t\n\r]"; " ") | gsub(" +"; " "))
+    | @tsv' 2>/dev/null || printf 'none\t(untitled)'
+}
+# Kept for every existing caller: same contract, same output, one third the cost.
 _title_for_file() {
-  local file="$1" chunk t
+  local file="$1" r
   [[ -f "$file" ]] || { echo "(no transcript)"; return; }
-  chunk="$(tail -c 262144 "$file" 2>/dev/null || true)"
-  t="$(grep '"type":"custom-title"' <<<"$chunk" | tail -1 | jq -r '.customTitle // empty' 2>/dev/null || true)"
-  [[ -z "$t" ]] && t="$(grep '"type":"ai-title"' <<<"$chunk" | tail -1 | jq -r '.aiTitle // empty' 2>/dev/null || true)"
-  [[ -z "$t" ]] && t="$(grep '"type":"last-prompt"' <<<"$chunk" | tail -1 | jq -r '.lastPrompt // empty' 2>/dev/null || true)"
-  if [[ -z "$t" ]]; then
-    t="$(grep '"type":"custom-title"' "$file" 2>/dev/null | tail -1 | jq -r '.customTitle // empty' 2>/dev/null || true)"
-    [[ -z "$t" ]] && t="$(grep '"type":"ai-title"' "$file" 2>/dev/null | tail -1 | jq -r '.aiTitle // empty' 2>/dev/null || true)"
-    [[ -z "$t" ]] && t="$(grep '"type":"last-prompt"' "$file" 2>/dev/null | tail -1 | jq -r '.lastPrompt // empty' 2>/dev/null || true)"
-  fi
-  echo "${t:-(untitled)}"
+  r="$(_title_read "$file")"
+  echo "${r#*$'\t'}"
 }
 
 # Best-effort cwd recorded inside a transcript — the encoded project dir name is

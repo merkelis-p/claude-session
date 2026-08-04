@@ -122,6 +122,7 @@ set -euo pipefail
 . "$CLAUDE_HELPERS_LIB/titles.sh"
 . "$CLAUDE_HELPERS_LIB/ledger.sh"
 . "$CLAUDE_HELPERS_LIB/schedule.sh"
+. "$CLAUDE_HELPERS_LIB/titleindex.sh"
 . "$CLAUDE_HELPERS_LIB/json.sh"
 
 # ---- account registry -------------------------------------------------------
@@ -188,8 +189,9 @@ _all_accounts() {
 # lands. --json for anything else is a hard error: answering a --json request
 # with the human box-drawn rendering would be a silently-wrong answer.
 # "accounts" covers `accounts ls --json` (lib/json.sh's _json_section_accounts);
-# "_snapshot" is the internal envelope verb, also from lib/json.sh.
-_JSON_READY_VERBS="accounts _snapshot"
+# "_snapshot" is the internal envelope verb, also from lib/json.sh; "_titles" is
+# the lazy per-window title resolver (lib/titleindex.sh's _titles_window).
+_JSON_READY_VERBS="accounts _snapshot _titles"
 _json_guard() {
   local verb="${1:-<none>}"
   (( JSON_OUT == 1 )) || return 0
@@ -710,7 +712,29 @@ _doctor_warnings() {
     n=$((n+1))
   fi
 
+  # (8) Title index health. A degraded cache never announces itself any other
+  # way — a query beside it just falls back to a slower read — so `doctor` is
+  # where a user learns to run the rebuild.
+  local ti_out; ti_out="$(_doctor_title_index || true)"
+  if [[ -n "$ti_out" ]]; then
+    printf '%s\n' "$ti_out"
+    n=$((n + $(wc -l <<<"$ti_out")))
+  fi
+
   return "$n"
+}
+
+# Title index check (8) for _doctor_warnings above. Runs unconditionally — the
+# index's health has nothing to do with whether any Claude session is currently
+# alive. Each detected problem TYPE (unreadable lines, duplicate lines) is its
+# own line and counts as one issue, same as every other check here.
+_doctor_title_index() {
+  _ti_load
+  (( TI_SKIPPED > 0 )) && printf '%b title index: %d unreadable line(s) — run claude-session _titles --rebuild\n' \
+    "$GLYPH_ALERT" "$TI_SKIPPED"
+  (( TI_DUPES > 0 )) && printf '%b title index: %d duplicate line(s) — run claude-session _titles --rebuild\n' \
+    "$GLYPH_ALERT" "$TI_DUPES"
+  return 0
 }
 
 # Per-pid: does it have any warning? Lightweight check used by `ls` to mark cards.
@@ -1626,6 +1650,20 @@ case "$a1" in
   _schedule-run) cmd_schedule_run "$a2"; exit $? ;;
   _snapshot) cmd_snapshot; exit $? ;;   # internal: one envelope per poll cycle, for the app (lib/json.sh)
   _preview) _preview_for_sid "$a2" "${3:-}" "$(_account_dir_or_default "${4:-default}")"; exit 0 ;;   # internal: fzf preview hook (sid, cwd, account)
+  _titles)
+    (( JSON_OUT == 1 )) || { echo "claude-session _titles: requires --json" >&2; exit 2; }
+    if (( TI_REBUILD == 1 )); then
+      # The ONLY full build. ~54s on this host for 6810 transcripts, so it is never
+      # reached from a listing path — a user waiting for a list must never wait for
+      # a cache. The app offers it as an explicit action that hands over the
+      # terminal (Task 18), and install.sh only ever suggests it.
+      _ti_rebuild || exit 1
+      printf '{"schemaVersion":%s,"rebuilt":true,"entries":%s}\n' "$JSON_SCHEMA_VERSION" \
+        "$(awk 'NR>1' "$TITLE_INDEX" | wc -l | tr -d ' ')"
+      exit 0
+    fi
+    _titles_window "$(_account_dir_or_default "${ACCOUNT:-default}")" ${SNAP_SIDS//,/ }
+    exit $? ;;
   kill)
     if [[ -z "$a2" ]]; then cmd_kill; else tmux kill-session -t "$a2"; fi
     exit 0 ;;

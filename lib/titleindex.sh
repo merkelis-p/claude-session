@@ -40,14 +40,32 @@ TITLE_INDEX="${TITLE_INDEX:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-helpers/title
 TITLE_INDEX_VERSION=1
 
 declare -A _TI=()
-TI_STATE="cold"; TI_ENTRIES=0; TI_SKIPPED=0; TI_DUPES=0; TI_HITS=0; TI_MISSES=0
+TI_STATE="cold"; TI_ENTRIES=0; TI_SKIPPED=0; TI_DUPES=0; TI_STALE=0; TI_HITS=0; TI_MISSES=0
 _TI_LOADED=0
 
 _ti_key() { printf '%s\t%s\t%s' "$1" "$2" "$3"; }
 
-# One awk over the whole file. A line is loaded only if it has 5 fields, numeric
-# mtime and size, and no control characters; anything else is COUNTED and skipped,
-# so `doctor` can report a damaged cache instead of the cache quietly shrinking.
+# One awk over the whole file, for whole-file statistics ONLY (_ti_stats, the
+# doctor check). This is NOT on the window's hot path — see _ti_lookup_window
+# below for that. A line is loaded only if it has >=5 fields, numeric mtime and
+# size, and a non-empty path; anything else is COUNTED and skipped, so `doctor`
+# can report a damaged cache instead of the cache quietly shrinking.
+#
+# The field split, numeric validation and STALE computation all happen inside
+# the one awk process; the bash loop below only ever does inline string
+# concatenation and the `read` builtin — never `$(...)` — because a fork per
+# index line is exactly the mistake measured on this cache: 6,810 lines of
+# `k="$(_ti_key ...)"` took _ti_load from ~1.8s to ~15.8s by itself.
+#
+# STALE: a line is superseded (dead weight) if the SAME transcript path
+# recurs LATER in the file with a DIFFERENT (mtime,size) — the file changed
+# since this line was written, so this exact key can never be looked up
+# again. That requires knowing what comes after a line, so the awk script
+# below does two internal passes over its own buffered arrays (right-to-left
+# to compute staleness, then left-to-right to emit) — still one process, one
+# read of the file, no second bash loop. STALE is distinct from a DUPE (the
+# same path+mtime+size written twice, a write anomaly): a run of the same key
+# repeated verbatim is never counted stale, only dup'd.
 _ti_load() {
   (( _TI_LOADED )) && return 0
   _TI_LOADED=1
@@ -58,19 +76,60 @@ _ti_load() {
     # meaning of would be the one failure mode this cache must not have.
     TI_STATE="cold"; return 0
   fi
-  local line k
+  local line k p m sz src title stale
   while IFS= read -r line; do
-    if [[ "$line" != *$'\t'*$'\t'*$'\t'*$'\t'* ]]; then TI_SKIPPED=$((TI_SKIPPED+1)); continue; fi
-    IFS=$'\t' read -r p m sz src title <<<"$line"
-    if [[ ! "$m" =~ ^[0-9]+$ || ! "$sz" =~ ^[0-9]+$ || -z "$p" ]]; then
-      TI_SKIPPED=$((TI_SKIPPED+1)); continue
-    fi
-    k="$(_ti_key "$p" "$m" "$sz")"
+    IFS=$'\t' read -r stale p m sz src title <<<"$line"
+    # The summary row (always last) carries the skipped-line count in the `p`
+    # slot and a sentinel of "END" where a real row would have "0" or "1" —
+    # `stale` is first specifically so an overflowed title (extra embedded
+    # tabs, tolerated the same way the old 5-field `read` tolerated them)
+    # never gets misread as this sentinel: the overflow can only land in the
+    # LAST variable (title), never the first.
+    if [[ "$stale" == "END" ]]; then TI_SKIPPED=$((TI_SKIPPED + p)); continue; fi
+    k="$p"$'\t'"$m"$'\t'"$sz"             # inline concatenation — no subshell fork
     [[ -n "${_TI[$k]:-}" ]] && TI_DUPES=$((TI_DUPES+1))
-    _TI[$k]="$src"$'\t'"$title"          # later line wins
+    _TI[$k]="$src"$'\t'"$title"           # later line wins
     TI_ENTRIES=$((TI_ENTRIES+1))
-  done < <(awk 'NR>1' "$TITLE_INDEX" 2>/dev/null || true)
-  if (( TI_SKIPPED > 0 )); then TI_STATE="corrupt"; else TI_STATE="warm"; fi
+    [[ "$stale" == "1" ]] && TI_STALE=$((TI_STALE+1))
+  done < <(awk -F'\t' -v OFS='\t' '
+    NR==1 { next }                         # header
+    {
+      if (NF < 5) { skipped++; next }
+      p=$1; m=$2; s=$3; src=$4
+      title=$5; for (i=6;i<=NF;i++) title = title OFS $i
+      if (m !~ /^[0-9]+$/ || s !~ /^[0-9]+$/ || length(p) == 0) { skipped++; next }
+      n++
+      L_p[n]=p; L_m[n]=m; L_s[n]=s; L_src[n]=src; L_title[n]=title
+    }
+    END {
+      # Right-to-left: distinct[p]/sole[p] track, scanning from the end, how
+      # many DIFFERENT (mtime,size) pairs for path p have been seen so far
+      # among lines AFTER i — that is exactly "superseded by a later line
+      # with a different mtime/size".
+      for (i = n; i >= 1; i--) {
+        p = L_p[i]; mykey = L_m[i] SUBSEP L_s[i]
+        dc = distinct[p] + 0
+        if      (dc >= 2) is_stale[i] = 1
+        else if (dc == 1) is_stale[i] = (sole[p] == mykey) ? 0 : 1
+        else               is_stale[i] = 0
+        fk = p SUBSEP mykey
+        if (!(fk in seen)) {
+          seen[fk] = 1
+          distinct[p] = dc + 1
+          if (dc + 1 == 1) sole[p] = mykey
+        }
+      }
+      for (i = 1; i <= n; i++) print is_stale[i], L_p[i], L_m[i], L_s[i], L_src[i], L_title[i]
+      print "END", skipped+0, "", "", "", ""
+    }
+  ' "$TITLE_INDEX" 2>/dev/null || true)
+  if (( TI_SKIPPED > 0 )); then
+    TI_STATE="corrupt"
+  elif (( TI_STALE > (TI_ENTRIES - TI_STALE) )); then
+    TI_STATE="stale"
+  else
+    TI_STATE="warm"
+  fi
 }
 
 _ti_lookup() {
@@ -78,6 +137,41 @@ _ti_lookup() {
   local v="${_TI[$(_ti_key "$1" "$2" "$3")]:-}"
   if [[ -n "$v" ]]; then TI_HITS=$((TI_HITS+1)); printf '%s' "$v"; return 0; fi
   TI_MISSES=$((TI_MISSES+1)); return 1
+}
+
+# Batch lookup for the window path: ONE awk pass over the index, given the set
+# of requested keys, emitting only the lines that match. This is the "one awk
+# over the index" the window needs — cost proportional to the WINDOW (the
+# newline-separated "path<TAB>mtime<TAB>size" keys passed in $1, at most
+# CHAT_LIMIT rows), never to the index (6,810 lines and growing without bound,
+# since every mtime/size change appends rather than compacts). No bash loop
+# ever iterates the index here — the awk script alone does the field split,
+# structural validation and "later line wins" resolution — and no bash loop
+# iterates per requested key either (they are all handed to awk in one shot).
+#
+# Same structural-validity rule as _ti_load: >=5 fields, numeric mtime/size,
+# non-empty path. A line failing that is never matched, exactly the "counted
+# and skipped, never loosely parsed" rule — it just isn't the whole-file
+# COUNT this function needs (_ti_load owns that, for doctor).
+_ti_lookup_window() {
+  local keys="$1"
+  [[ -n "$keys" ]] || return 0
+  [[ -r "$TITLE_INDEX" ]] || return 0
+  local hdr; hdr="$(head -1 "$TITLE_INDEX" 2>/dev/null || true)"
+  [[ "$hdr" == "#v$TITLE_INDEX_VERSION "* ]] || return 0
+  awk -F'\t' -v OFS='\t' '
+    NR==FNR { if (length($0)) wanted[$0]=1; next }   # file 1: the requested keys
+    FNR==1  { next }                                  # file 2: skip its header
+    {
+      if (NF < 5) next
+      if ($2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/ || length($1) == 0) next
+      key = $1 OFS $2 OFS $3
+      if (!(key in wanted)) next
+      title = $5; for (i = 6; i <= NF; i++) title = title OFS $i
+      out[key] = $4 OFS title            # later line wins (forward scan order)
+    }
+    END { for (k in out) print k OFS out[k] }
+  ' <(printf '%s' "$keys") "$TITLE_INDEX" 2>/dev/null
 }
 
 # Append one entry. Cheap enough to call per resolved row; _ti_rebuild compacts.
@@ -117,32 +211,59 @@ _ti_rebuild() {
   mv -f "$tmp" "$TITLE_INDEX" && trap - RETURN
 }
 
-_ti_stats() { _ti_load; printf '%s\t%s\t%s\t%s\t%s\t%s' \
-  "$TI_STATE" "$TI_HITS" "$TI_MISSES" "$TI_ENTRIES" "$TI_DUPES" "$TI_SKIPPED"; }
+_ti_stats() { _ti_load; printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+  "$TI_STATE" "$TI_HITS" "$TI_MISSES" "$TI_ENTRIES" "$TI_DUPES" "$TI_SKIPPED" "$TI_STALE"; }
 
 # Resolve a bounded window of sids: index first, transcript second, write back.
 # THIS is the lazy fallback — the app calls it for the rows it is about to paint,
 # so a cold cache costs one 8ms read per visible row instead of blocking a list.
 #
-# _ti_load is primed HERE, once, in this function's own (non-subshell) frame.
-# Every _ti_lookup call below runs inside `$(...)`, i.e. its own forked subshell —
-# without this priming call, _ti_load's `_TI_LOADED` guard would never see itself
-# set in the PARENT, so each iteration would re-fork awk and re-parse the entire
-# index from scratch, once per row, exactly the per-row-fork anti-pattern this
-# project has already paid for twice (_session_rows, owner_tmux). Priming here
-# means the subshells inherit an already-populated `_TI` by fork-copy instead.
+# Deliberately does NOT call _ti_load. _ti_load builds an associative array of
+# the WHOLE index (needed for doctor/_ti_stats' whole-file counts), and even
+# with the per-line fork removed, just running the bash read loop over 6,810
+# lines costs ~570ms before a single row is resolved — paid by a 1-sid window
+# exactly as much as a 200-sid one. Instead: resolve every sid's (path, mtime,
+# size) first (bounded by the window), hand the whole set to _ti_lookup_window
+# for ONE awk pass over the index (see there), then do a second bounded pass
+# using the (at most window-sized) hash of matches. Cost is now proportional
+# to the window, never to the index.
 _titles_window() {
   local acct_dir="$1"; shift
-  _ti_load
-  local sid f m sz r rows=""
+  local sid f m sz rows="" keys=""
+  local -a w_sid=() w_f=() w_m=() w_sz=()
   for sid in "$@"; do
     [[ -z "$sid" ]] && continue
     f="$(_transcript_for_sid "$sid" "" "$acct_dir")"
     if [[ -z "$f" || ! -f "$f" ]]; then
-      rows+="$(printf '%s\tunknown\tnone\t' "$sid")"$'\n'; continue
+      w_sid+=("$sid"); w_f+=(""); w_m+=(""); w_sz+=("")
+      continue
     fi
     m="$(_file_mtime "$f" 2>/dev/null || echo 0)"; sz="$(wc -c < "$f" 2>/dev/null || echo 0)"; sz="${sz// /}"
-    if r="$(_ti_lookup "$f" "$m" "$sz")"; then :; else
+    w_sid+=("$sid"); w_f+=("$f"); w_m+=("$m"); w_sz+=("$sz")
+    keys+="$f"$'\t'"$m"$'\t'"$sz"$'\n'
+  done
+
+  # ONE awk fork for the whole window, regardless of window size (the "index
+  # is parsed once for the whole window" invariant) — not one fork per row and
+  # not a full-index bash loop.
+  local -A hit=()
+  local line p m2 sz2 src title
+  if [[ -n "$keys" ]]; then
+    while IFS= read -r line; do
+      IFS=$'\t' read -r p m2 sz2 src title <<<"$line"
+      [[ -z "$p" ]] && continue
+      hit["$p"$'\t'"$m2"$'\t'"$sz2"]="$src"$'\t'"$title"
+    done < <(_ti_lookup_window "$keys")
+  fi
+
+  local i n=${#w_sid[@]} r
+  for (( i = 0; i < n; i++ )); do
+    sid="${w_sid[$i]}"; f="${w_f[$i]}"; m="${w_m[$i]}"; sz="${w_sz[$i]}"
+    if [[ -z "$f" ]]; then
+      rows+="$(printf '%s\tunknown\tnone\t' "$sid")"$'\n'; continue
+    fi
+    r="${hit["$f"$'\t'"$m"$'\t'"$sz"]:-}"
+    if [[ -z "$r" ]]; then
       r="$(_title_read "$f")"; _ti_put "$f" "$m" "$sz" "${r%%$'\t'*}" "${r#*$'\t'}" || true
     fi
     rows+="$(printf '%s\tknown\t%s' "$sid" "$r")"$'\n'

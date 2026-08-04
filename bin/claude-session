@@ -726,14 +726,20 @@ _doctor_warnings() {
 
 # Title index check (8) for _doctor_warnings above. Runs unconditionally — the
 # index's health has nothing to do with whether any Claude session is currently
-# alive. Each detected problem TYPE (unreadable lines, duplicate lines) is its
-# own line and counts as one issue, same as every other check here.
+# alive. Each detected problem TYPE (unreadable lines, duplicate lines, a stale
+# majority) is its own line and counts as one issue, same as every other check
+# here.
 _doctor_title_index() {
   _ti_load
   (( TI_SKIPPED > 0 )) && printf '%b title index: %d unreadable line(s) — run claude-session _titles --rebuild\n' \
     "$GLYPH_ALERT" "$TI_SKIPPED"
   (( TI_DUPES > 0 )) && printf '%b title index: %d duplicate line(s) — run claude-session _titles --rebuild\n' \
     "$GLYPH_ALERT" "$TI_DUPES"
+  # Append-only growth means every mtime/size change adds a line and nothing
+  # ever compacts one away — TI_STALE lines are the dead weight from that.
+  # _ti_load already sets TI_STATE=stale once they outnumber live entries.
+  [[ "$TI_STATE" == "stale" ]] && printf '%b title index: stale — %d superseded line(s) outnumber %d live — run claude-session _titles --rebuild\n' \
+    "$GLYPH_ALERT" "$TI_STALE" "$((TI_ENTRIES - TI_STALE))"
   return 0
 }
 

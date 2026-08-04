@@ -151,4 +151,63 @@ n="$(awk 'NR>1' "$IDX" | wc -l | tr -d ' ')"
   || { echo "FAIL: --rebuild indexed only $n entries" >&2; fail=1; }
 assert_eq "$(_ti_probe_state)" "warm" \
   "a full index reports warm" || fail=1
+
+# --- regression: window cost must scale with the WINDOW, not the INDEX -----
+# Before this fix, `_titles_window` primed a FULL `_ti_load` unconditionally —
+# a bash `while read` loop over the WHOLE index, with a `$(...)` fork PER LINE
+# inside it (`k="$(_ti_key ...)"`) — so a 1-sid window paid for every line in
+# the index no matter how few rows it actually asked for. Measured on the
+# reference host, via the real CLI in a hermetic fake HOME (same shape as
+# this fixture, scaled up):
+#   index with 2 lines,    1-sid window:      89 ms
+#   index with 6812 lines, 1-sid window:  10 971 ms
+# 6,810 entries is that host's actual transcript count — the normal case, not
+# a corner. After this fix (one awk pass over the index, keyed to only the
+# requested window; see lib/titleindex.sh's _ti_lookup_window), the same
+# 6,810-line measurement is ~70ms — about two orders of magnitude under the
+# budget below, which is deliberate: the ceiling has to absorb a loaded CI
+# runner without the fixed cost getting anywhere near it. Wall-clock
+# assertions flake, so the budget is picked wide (2000ms) — the pre-fix code
+# still misses it by ~5x, which is not a close call either way.
+#
+# Build the large index by APPENDING synthetic lines to the index this test
+# already warmed via --rebuild above (real fixture titles at the front, so a
+# correctness check rides along for free) — no real paths/session ids, per
+# repo policy; s-N is synthetic.
+awk 'BEGIN{for(i=1;i<=5200;i++) printf "/home/u/p/s-%d.jsonl\t%d\t%d\tnone\t(untitled)\n", i, 1700000000+i, 100+i}' >> "$IDX"
+idx_lines="$(awk 'NR>1' "$IDX" | wc -l | tr -d ' ')"
+if (( idx_lines >= 5000 )); then
+  echo "PASS: the regression fixture index has $idx_lines lines (>= 5000)"
+else
+  echo "FAIL: setup — synthetic index only has $idx_lines lines, need >= 5000" >&2; fail=1
+fi
+
+_now_ms() {   # no fork on bash 5 (EPOCHREALTIME); degrades to whole seconds on bash 4
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then
+    # Separate `local` statements: under `set -u`, RHS expansions in ONE
+    # `local` command are evaluated in the OUTER scope before any of the new
+    # bindings take effect (see lib/json.sh's _epoch_ms for the same note) —
+    # `r` would read as unbound there on its first-ever call.
+    local r="${EPOCHREALTIME/,/.}"
+    local s="${r%%.*}"
+    local f="${r#*.}"
+    printf '%s' "$(( 10#$s * 1000 + 10#${f:0:3} ))"
+  else
+    printf '%s' "$(( $(date +%s) * 1000 ))"
+  fi
+}
+t_start="$(_now_ms)"
+big_out="$("$CS" _titles --json --account=default --sids=sid-a 2>&1)"
+elapsed=$(( $(_now_ms) - t_start ))
+# sid-a's transcript ($t1) had a "Renamed" custom-title record appended to it
+# in the invalidation section above, so that's its current, correct title —
+# NOT the original "Fix the retry handler" fixture text.
+assert_eq "$(jq -r '.items[0].title.value' <<<"$big_out" 2>/dev/null)" "Renamed" \
+  "a 1-sid window still resolves the right title against a $idx_lines-line index" || fail=1
+if (( elapsed <= 2000 )); then
+  echo "PASS: a 1-sid window against a $idx_lines-line index completes within budget (${elapsed}ms <= 2000ms budget)"
+else
+  echo "FAIL: a 1-sid window against a $idx_lines-line index took ${elapsed}ms — budget is 2000ms" >&2
+  fail=1
+fi
 exit "$fail"

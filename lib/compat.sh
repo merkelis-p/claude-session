@@ -17,6 +17,16 @@ _compat_os() {
   esac
 }
 
+# Is it legitimate to prompt the human on stdin? A TTY alone is not enough: the
+# TUI owns the terminal and execs us as a child, so stdin may well be a TTY while
+# there is nobody to answer. CLAUDE_SESSION_UI=1 (and --json) set
+# CS_NONINTERACTIVE, and every prompt site consults this instead of testing -t
+# itself — one predicate, so a new prompt cannot forget the second half.
+_cs_interactive() {
+  [[ "${CS_NONINTERACTIVE:-0}" == 1 ]] && return 1
+  [[ -t 0 ]]
+}
+
 # ---- process wrappers (no OS branch) ---------------------------------------
 _proc_alive()     { [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null; }
 _proc_comm()      { [[ -n "${1:-}" ]] || return 1; ps -o comm= -p "$1" 2>/dev/null | sed 's/^ *//;s/ *$//'; }

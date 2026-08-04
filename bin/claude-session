@@ -85,7 +85,13 @@ if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
   exit 1
 fi
 
-VERSION="0.1.0"
+VERSION="0.2.0"
+# The envelope schema version the --json emitters produce (lib/json.sh). Bumped
+# only when a field is REMOVED or changes meaning — additions are forward-
+# compatible by contract, so the Go binary ignores fields it does not know.
+# tests/test_json.sh asserts this equals the binary's schemaMax by grepping both
+# files, so bash↔Go skew is caught at build time rather than at runtime.
+JSON_SCHEMA_VERSION=1
 
 # Resolve our library directory from our own location, not from $HOME: the same
 # file must work from an install prefix (../share/claude-helpers) and from a repo
@@ -175,6 +181,18 @@ _all_accounts() {
   for n in "${ACCT_NAMES[@]+"${ACCT_NAMES[@]}"}"; do
     printf '%s\t%s\n' "$n" "${ACCT_DIR[$n]}"
   done
+}
+
+# Verbs whose --json emitter exists in this build. Appended to as each emitter
+# lands. --json for anything else is a hard error: answering a --json request
+# with the human box-drawn rendering would be a silently-wrong answer.
+_JSON_READY_VERBS=""
+_json_guard() {
+  local verb="${1:-<none>}"
+  (( JSON_OUT == 1 )) || return 0
+  case " $_JSON_READY_VERBS " in *" $verb "*) return 0 ;; esac
+  echo "claude-session: --json is not available for '$verb' in this build" >&2
+  exit 2
 }
 
 # ---- session model ---------------------------------------------------------
@@ -844,7 +862,7 @@ cmd_resume() {
       "$DIM" "$BOLD" "$N"
     return 0
   fi
-  if (( PLAIN == 1 )) || [[ ! -t 0 || ! -t 1 ]]; then
+  if (( PLAIN == 1 )) || ! _cs_interactive || [[ ! -t 1 ]]; then
     printf '%bresume needs a terminal. Sessions: %s — attach with: %bclaude-session <project>%b\n' \
       "$DIM" "$LS_COUNT" "$BOLD" "$N"
     return 0
@@ -926,7 +944,7 @@ cmd_kill() {
     printf '%bno sessions to kill — nothing running.%b\n' "$DIM" "$N"
     return 0
   fi
-  if (( PLAIN == 1 )) || [[ ! -t 0 || ! -t 1 ]]; then
+  if (( PLAIN == 1 )) || ! _cs_interactive || [[ ! -t 1 ]]; then
     printf '%bkill needs a terminal. Use: %bclaude-session kill <session>%b\n' "$DIM" "$BOLD" "$N"
     return 0
   fi
@@ -1138,7 +1156,7 @@ _do_reap() {
   fi
 
   if (( FORCE == 0 )); then
-    if [[ -t 0 ]]; then
+    if _cs_interactive; then
       printf '\n%breap %d orphaned process(es)? [y/N]%b ' "$R" "${#idle_pids[@]}" "$N"
       local confirm; read -r confirm || confirm=""
       if [[ "$confirm" != [yY] ]]; then
@@ -1369,6 +1387,11 @@ FORCE=0
 PLAIN=0
 REAP=0
 SHOW_VERSION=0
+JSON_OUT=0; DRY_RUN=0; ASSUME_YES=0; ACK_DIGESTS=""
+SCHED_WORK=""; SCHED_DAYS=""; SCHED_MIGRATE=0; SCHED_FROM_NOW=0
+QUOTA_RESET_AT=""; QUOTA_SOURCE=""; QUOTA_CLEAR=0
+UI_PLACE=""; SNAP_ONLY=""; CHAT_LIMIT=50
+COPY_GET=0
 HANDOFF=""
 CLAUDE_MODE="interactive"
 ACCOUNT=""
@@ -1393,7 +1416,7 @@ SCHED_AT=""; SCHED_IN=""
 # Deliberately excludes claude's own value flags (--model, --agent, --session-id):
 # those must reach claude untouched, which is why this list is explicit and not
 # "anything that looks like a flag".
-_CS_VALUE_FLAGS=" --handoff --mode --account --to --from --limit --chat --every --daily-at --once --timeout --cwd --at --in "
+_CS_VALUE_FLAGS=" --handoff --mode --account --to --from --limit --chat --every --daily-at --once --timeout --cwd --at --in --ack --work --days --reset-at --place --only --limit-chats "
 _norm=()
 while (( $# )); do
   if [[ -n "$1" && "$_CS_VALUE_FLAGS" == *" $1 "* ]]; then
@@ -1411,6 +1434,22 @@ for a in "$@"; do
     --plain)      PLAIN=1 ;;
     --reap)       REAP=1 ;;
     --version)    SHOW_VERSION=1 ;;
+    --json)         JSON_OUT=1 ;;
+    --dry-run)      DRY_RUN=1 ;;
+    --yes)          ASSUME_YES=1 ;;
+    --ack=*)        ACK_DIGESTS="${a#*=}" ;;
+    --work=*)       SCHED_WORK="${a#*=}" ;;
+    --days=*)       SCHED_DAYS="${a#*=}" ;;
+    --migrate)      SCHED_MIGRATE=1 ;;
+    --from-now)     SCHED_FROM_NOW=1 ;;
+    --reset-at=*)   QUOTA_RESET_AT="${a#*=}" ;;
+    --reported)     QUOTA_SOURCE="reported" ;;
+    --derived)      QUOTA_SOURCE="derived" ;;
+    --clear)        QUOTA_CLEAR=1 ;;
+    --place=*)      UI_PLACE="${a#*=}" ;;
+    --only=*)       SNAP_ONLY="${a#*=}" ;;
+    --limit-chats=*) CHAT_LIMIT="${a#*=}" ;;
+    --get)          COPY_GET=1 ;;
     # -p means --plain for own verbs; for native routing it's re-injected as
     # claude's --print alias at the native fall-through dispatch (never in ARGS,
     # so own-verb dispatch stays clean: `kill -p` → cmd_kill, `-p kill` → own kill).
@@ -1437,6 +1476,14 @@ for a in "$@"; do
     *)            ARGS+=("$a") ;;
   esac
 done
+# CLAUDE_SESSION_UI=1 is the app's contract with the core: never prompt on
+# stdin, never colorize, diagnostics to stderr. --json implies all three,
+# because a JSON document with an ANSI escape or a y/N prompt in it is garbage.
+if [[ "${CLAUDE_SESSION_UI:-0}" == 1 ]] || (( JSON_OUT == 1 )); then
+  CS_NONINTERACTIVE=1; export CS_NONINTERACTIVE
+  NO_COLOR=1; export NO_COLOR
+  _ui_disable_color
+fi
 # `"${ARGS[@]:-}"` expands to one EMPTY argument when ARGS is empty, which makes
 # $# read 1 for a bare `claude-session`. Use the +alternate form so empty really
 # means zero arguments.
@@ -1468,6 +1515,10 @@ ACCOUNT_SUFFIX=""
 # ---- native claude pass-through --------------------------------------------
 _NATIVE_SUBCMDS="update upgrade mcp auth install setup-token agents doctor ultrareview config plugin plugins project"
 
+# --json is OURS (own-flag parser, above) and is deliberately absent from this
+# list, exactly like --version: `claude-session --json` must emit our envelope,
+# not run `claude --json`. Claude's own --json is reached with
+# `claude-session -- --json`, which _native_is_inline still routes inline.
 # Is this argv a native claude invocation (subcommand or session/print flag)?
 _is_native_invocation() {
   local first="${1:-}"; shift || true
@@ -1476,7 +1527,7 @@ _is_native_invocation() {
   for a in "$first" "$@"; do
     case "$a" in
       -r|--resume|--resume=*|-c|--continue|--from-pr|-p|--print|\
-      --model|--model=*|--agent|--agent=*|--session-id|--session-id=*|--fork-session|--json) return 0 ;;
+      --model|--model=*|--agent|--agent=*|--session-id|--session-id=*|--fork-session) return 0 ;;
     esac
   done
   return 1
@@ -1539,6 +1590,8 @@ _dispatch_native() {
   fi
   _launch_native "$sess" "$dir" "$acct_dir" -- "${nargs[@]+"${nargs[@]}"}"
 }
+
+_json_guard "${a1:-}"
 
 case "$a1" in
   ls)       cmd_ls;     exit 0 ;;

@@ -158,7 +158,7 @@ _ledger_guard() {
     "$LEDGER_FILE" 2>/dev/null | tail -1)"
   if [[ -n "$rt" ]]; then
     [[ "$FORCE" == 1 ]] && return 0
-    if [[ ! -t 0 ]]; then
+    if ! _cs_interactive; then
       echo "claude-session transfer: round-trip detected ($to → $from earlier) — re-run with --force to confirm" >&2
       return 2
     fi
@@ -245,7 +245,7 @@ cmd_transfer_undo() {
     dmt=0
   fi
   if (( dmt > ts + 2 )); then
-    if [[ "$FORCE" == 0 && ! -t 0 ]]; then
+    if [[ "$FORCE" == 0 ]] && ! _cs_interactive; then
       echo "claude-session transfer undo: dest copy changed since transfer — refusing (resumed?). Use --force." >&2; exit 2
     fi
     if [[ "$FORCE" == 0 ]]; then
@@ -290,10 +290,10 @@ cmd_transfer_prune() {
   [[ -f "$LEDGER_FILE" ]] || { echo "claude-session transfer prune: no ledger" >&2; exit 1; }
   local found; found="$(jq -c --arg a "$id" 'select(.id==$a)' "$LEDGER_FILE" 2>/dev/null | head -1)"
   [[ -n "$found" ]] || { echo "claude-session transfer prune: no entry id '$id'" >&2; exit 1; }
-  if [[ "$FORCE" == 0 && ! -t 0 ]]; then
+  if [[ "$FORCE" == 0 ]] && ! _cs_interactive; then
     echo "claude-session transfer prune: needs confirmation — re-run with --force" >&2; exit 2
   fi
-  if [[ "$FORCE" == 0 && -t 0 ]]; then
+  if [[ "$FORCE" == 0 ]] && _cs_interactive; then
     printf 'prune ledger entry %s (record only, chat data untouched)? [y/N] ' "$id" >&2
     local ans; read -r ans; [[ "$ans" == [yY] ]] || { echo "cancelled" >&2; exit 0; }
   fi
@@ -340,7 +340,7 @@ cmd_transfer() {
         "$DIM" "$BOLD" "$from" "$N" "$DIM" "$(short_home "$src_dir")" "$N"
       return 0
     fi
-    if (( PLAIN == 1 )) || [[ ! -t 0 || ! -t 1 ]]; then
+    if (( PLAIN == 1 )) || ! _cs_interactive || [[ ! -t 1 ]]; then
       echo "claude-session transfer: picking a chat needs a terminal — pass an explicit sessionId" >&2
       echo "  claude-session transfer <sessionId> --to=$to --from=$from" >&2
       exit 2

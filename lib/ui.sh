@@ -10,6 +10,16 @@ else
   N= BOLD= DIM= R= G= Y= B= M= C=
 fi
 
+# Re-blank the palette after the fact. ui.sh decides color at SOURCE time, but
+# whether we may colorize is only known after flag parsing (--json, and the
+# app's CLAUDE_SESSION_UI=1). Glyphs move to the ASCII set at the same time:
+# they carry meaning, so they must survive a pipe that strips nothing.
+_ui_disable_color() {
+  N= BOLD= DIM= R= G= Y= B= M= C=
+  GLYPH_OK="*"; GLYPH_WARN="!"; GLYPH_FAIL="x"; GLYPH_CHECK="+"
+  GLYPH_DASH="-"; GLYPH_ALERT="!"
+}
+
 # ---- glyphs -----------------------------------------------------------------
 GLYPH_OK="${G}●${N}"     # ●
 GLYPH_WARN="${Y}○${N}"   # ○

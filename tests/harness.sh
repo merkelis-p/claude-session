@@ -67,6 +67,13 @@ setup_fake_home() {
 N=''; BOLD=''; DIM=''; Y=''; R=''; M=''; C=''
 GLYPH_CHECK='✓'; GLYPH_DASH='—'; GLYPH_OK='●'; GLYPH_WARN='○'; GLYPH_FAIL='✕'; GLYPH_ALERT='⚠'
 
+# No-op: the stub's palette is already blank and its glyphs already plain
+# enough for assertions, unlike the real ui.sh this mirrors (see _ui_disable_color
+# there). Must still exist — bin/claude-session calls it unconditionally under
+# --json/CLAUDE_SESSION_UI=1, and set -euo pipefail turns a missing function
+# into an immediate, wrongly-coded script exit instead of the real code path.
+_ui_disable_color() { :; }
+
 box_top() { echo ""; }
 box_line() { echo "  $1"; }
 box_blank() { echo ""; }

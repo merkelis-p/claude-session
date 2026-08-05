@@ -317,24 +317,56 @@ func TestFieldStateStringsRoundTrip(t *testing.T) {
 	}
 }
 
-func TestDecodePlanRoundTrip(t *testing.T) {
-	const doc = `{
-		"schemaVersion": 1,
-		"mutation": "transfer",
-		"argv": ["transfer", "sid-1", "--to=alpha"],
-		"target": {"kind": "chat", "sessionId": "sid-1", "account": "default"},
-		"effects": [{"kind": "move", "text": "moves sid-1 from default to alpha"}],
-		"willLose": [],
-		"confirmations": [{"kind": "transfer", "digest": "abc123", "text": "move this chat to alpha?"}],
-		"refusals": [],
-		"warnings": []
-	}`
-	p, err := DecodePlan([]byte(doc))
+// TestDecodePlanRealFixture decodes a plan captured verbatim from the bash
+// emitter (lib/plan.sh, `transfer sid-x --to=alpha --move --json --dry-run`,
+// paths sanitized to /home/u). It is the contract guard the first version of
+// this test lacked: that version hand-authored the document using the Go
+// struct's OWN (wrong) shape — `target.sessionId`, `effects[].text` — so it
+// passed while `DecodePlan` silently dropped `target.sid/title/dest` and every
+// `effect.path` from every real plan. A fixture the emitter actually produces
+// cannot drift from the emitter without someone regenerating it, and it fails
+// the moment a json tag stops matching a real key.
+//
+// To regenerate after a deliberate bash-side plan-shape change:
+//
+//	<emit a move plan in a fake HOME> | jq -S . | sed "s#$HOME#/home/u#g"
+//
+// then hand-check the encoded project-dir segment is /home/u-based too.
+func TestDecodePlanRealFixture(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("testdata", "plan-transfer-move.json"))
+	if err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	p, err := DecodePlan(b)
 	if err != nil {
 		t.Fatalf("DecodePlan: %v", err)
 	}
-	if p.Mutation != "transfer" || p.Target.SessionID != "sid-1" || len(p.Confirmations) != 1 {
-		t.Fatalf("unexpected Plan: %+v", p)
+	if p.Mutation != "transfer.move" {
+		t.Fatalf("mutation = %q, want transfer.move", p.Mutation)
+	}
+	// Target: every field the emitter populated must survive decode. sid/title/
+	// dest are exactly what the old sessionId/kind/scheduleId tags dropped.
+	if p.Target.Account != "alpha" || p.Target.SID != "sid-x" || p.Target.Title != "A chat" {
+		t.Fatalf("target lost fields: %+v", p.Target)
+	}
+	if p.Target.Dest == "" {
+		t.Fatal("target.dest dropped — the app cannot show where the chat is going")
+	}
+	// Effects: each must carry its Path (the file/pid it acts on). The old
+	// `text` tag decoded every effect as {Kind, Path:""}.
+	if len(p.Effects) != 2 {
+		t.Fatalf("effects = %d, want 2", len(p.Effects))
+	}
+	for i, e := range p.Effects {
+		if e.Kind == "" || e.Path == "" {
+			t.Fatalf("effect[%d] = %+v — kind or path lost (the object of the action is gone)", i, e)
+		}
+	}
+	if p.Effects[0].Kind != "write" || p.Effects[1].Kind != "remove" {
+		t.Fatalf("effect kinds = %q/%q, want write/remove", p.Effects[0].Kind, p.Effects[1].Kind)
+	}
+	if len(p.WillLose) != 1 {
+		t.Fatalf("willLose = %d, want 1", len(p.WillLose))
 	}
 }
 

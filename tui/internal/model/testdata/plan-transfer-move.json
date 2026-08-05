@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "mutation": "transfer.move",
+  "argv": [
+    "claude-session",
+    "transfer",
+    "sid-x",
+    "--to=alpha",
+    "--from=default",
+    "--move"
+  ],
+  "target": {
+    "account": "alpha",
+    "sid": "sid-x",
+    "title": "A chat",
+    "dest": "/home/u/.claude-alpha/projects/-home-u-api/sid-x.jsonl"
+  },
+  "effects": [
+    { "kind": "write", "path": "/home/u/.claude-alpha/projects/-home-u-api/sid-x.jsonl" },
+    { "kind": "remove", "path": "/home/u/.claude/projects/-home-u-api/sid-x.jsonl" }
+  ],
+  "willLose": [
+    "the source copy under 'default' (reversible: claude-session transfer undo <id>)"
+  ],
+  "confirmations": [],
+  "refusals": [],
+  "warnings": []
+}

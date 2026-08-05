@@ -18,10 +18,19 @@ assert_contains "$(cat "$CLAUDE_CALLS")" "argv: --json" "claude-session -- --jso
 
 # (3) --json on a verb with no emitter yet is a HARD ERROR, never the human
 #     rendering. Printing box-drawn text in answer to --json would be a
-#     silently-wrong answer, which this tool never gives.
-out="$("$CS" ls --json 2>&1)"; rc=$?
+#     silently-wrong answer, which this tool never gives. `ls` gained an
+#     emitter in this task (chats+issues) — `resume` has not, and is a
+#     representative still-unready verb for this guard.
+out="$("$CS" resume --json 2>&1)"; rc=$?
 assert_eq "$rc" "2" "--json without an emitter exits 2" || fail=1
 assert_contains "$out" "--json is not available" "--json without an emitter says so" || fail=1
+
+# (3b) ls/doctor DID gain an emitter in this task — --json for them must now
+# succeed (valid JSON, not the hard-error path above).
+"$CS" ls --json >/dev/null 2>&1; assert_eq "$?" "0" "ls --json now succeeds (emitter added)" || fail=1
+jq -e . >/dev/null 2>&1 <<<"$("$CS" ls --json 2>/dev/null)" \
+  && echo "PASS: ls --json emits valid JSON" \
+  || { echo "FAIL: ls --json did not emit valid JSON" >&2; fail=1; }
 
 # (4) version + schema constants
 assert_contains "$("$CS" --version 2>&1)" "claude-session 0.2.0" "--version reports 0.2.0" || fail=1

@@ -191,7 +191,7 @@ _all_accounts() {
 # "accounts" covers `accounts ls --json` (lib/json.sh's _json_section_accounts);
 # "_snapshot" is the internal envelope verb, also from lib/json.sh; "_titles" is
 # the lazy per-window title resolver (lib/titleindex.sh's _titles_window).
-_JSON_READY_VERBS="accounts _snapshot _titles"
+_JSON_READY_VERBS="accounts _snapshot _titles ls doctor"
 _json_guard() {
   local verb="${1:-<none>}"
   (( JSON_OUT == 1 )) || return 0
@@ -386,8 +386,15 @@ _ps_snapshot_rows() {
 # ownership ourselves via _proc_owner_uid when running against the real
 # process table (skipped for $ORPHAN_PS_SRC fixtures, which have no real pids
 # to query).
+#
+# Optional $1 = a pre-computed _ps_snapshot_rows result. _doctor_warnings
+# needs BOTH this and _stuck_build_rows' scan on every call, and they read
+# the identical process table — passing the one snapshot down avoids paying
+# for it twice. Falls back to scanning itself when called with no argument
+# (every other caller, e.g. _do_reap, an occasional/human-confirmed op where
+# a second `ps`/file-read is not worth complicating the call site over).
 _orphan_rows() {
-  local rows; rows="$(_ps_snapshot_rows || true)"
+  local rows; if (( $# >= 1 )); then rows="$1"; else rows="$(_ps_snapshot_rows || true)"; fi
   [[ -z "$rows" ]] && return 0
 
   local check_owner=1
@@ -421,8 +428,11 @@ _orphan_rows() {
 # running > 600s — regardless of parentage. A plugin/package build takes
 # seconds; one running 10+ minutes is hung, whether or not its parent is
 # still alive. Same TSV shape as _orphan_rows.
+#
+# Optional $1 = a pre-computed _ps_snapshot_rows result — see _orphan_rows'
+# own comment for why _doctor_warnings passes the same snapshot to both.
 _stuck_build_rows() {
-  local rows; rows="$(_ps_snapshot_rows || true)"
+  local rows; if (( $# >= 1 )); then rows="$1"; else rows="$(_ps_snapshot_rows || true)"; fi
   [[ -z "$rows" ]] && return 0
 
   local pid ppid etimes pcpu comm args
@@ -565,7 +575,25 @@ _orphan_activity() {
 # `$(...)` subshell, so any cache built *inside* it is discarded the instant
 # that subshell exits — only hoisting the one real scan into the caller's own
 # shell and handing the result down here works.
+#
+# _DOCTOR_ISSUES: the SAME data, structured, for lib/json.sh's issues/processes
+# sections. One implementation, two renderings — every check below both PRINTS
+# its existing human line (unchanged, byte-for-byte) AND appends a
+# kind<TAB>severity<TAB>pid<TAB>sid<TAB>text row here. A bash array element can
+# hold an embedded tab safely (there is no IFS splitting until something reads
+# it back with `read`/`split` on purpose), so this is not the "tab is IFS
+# whitespace" hazard — that hazard is about a per-row `read`, not about storing
+# a pre-joined string in an array slot. Reset at the top of every call: this
+# function can run more than once per process (ls, then doctor), and a stale
+# row from an earlier call must never leak into a later section.
+declare -a _DOCTOR_ISSUES=()
+_di_add() {
+  # kind severity pid sid text — '-' for pid/sid when not applicable, matching
+  # this codebase's existing TSV-placeholder convention (_SESSION_JQ's `def d`).
+  _DOCTOR_ISSUES+=("$1"$'\t'"$2"$'\t'"${3:--}"$'\t'"${4:--}"$'\t'"$5")
+}
 _doctor_warnings() {
+  _DOCTOR_ISSUES=()
   local rows
   if (( $# >= 1 )); then rows="$1"; else rows="$(_session_rows || true)"; fi
   local n=0
@@ -586,6 +614,8 @@ _doctor_warnings() {
       printf '%b same chat %s open in %d procs: %s\n' \
         "$GLYPH_ALERT" "$(truncate_str "$sid" 18)" "$count" "$(truncate_str "$pids" 40)"
       n=$((n+1))
+      _di_add "same-chat-twice" "warning" "" "$sid" \
+        "same chat open in $count procs: $pids"
     fi
   done < <(awk -F '\t' '$6!="-" && $6!="" { a[$6] = (a[$6] ? a[$6]":" : "") $2 } END { for (k in a) print k"\t"a[k] }' <<<"$rows")
 
@@ -597,6 +627,8 @@ _doctor_warnings() {
       printf '%b RC bridge %s held by %d procs: %s\n' \
         "$GLYPH_ALERT" "$(truncate_str "$bid" 18)" "$count" "$(truncate_str "$pids" 40)"
       n=$((n+1))
+      _di_add "rc-bridge-shared" "warning" "" "" \
+        "RC bridge $bid held by $count procs: $pids"
     fi
   done < <(awk -F '\t' '$7!="-" && $7!="" { a[$7] = (a[$7] ? a[$7]":" : "") $2 } END { for (k in a) print k"\t"a[k] }' <<<"$rows")
 
@@ -616,6 +648,8 @@ _doctor_warnings() {
           "$GLYPH_ALERT" "$(short_home "$dup_cwd")" "$acct_tag" "$total" "$bridged"
         printf '    PIDs: %s\n' "$(truncate_str "$group" 60)"
         n=$((n+1))
+        _di_add "duplicate-bridge" "warning" "" "" \
+          "$dup_cwd$acct_tag: $total procs, $bridged bridged — others mirror text, no approvals ($group)"
       fi
     fi
   done < <(awk -F '\t' '{mark=($7!="-" && $7!="")?"|OK":""; printf "%s#%s\t%s%s\n",$3,$10,$2,mark}' <<<"$rows" \
@@ -631,6 +665,8 @@ _doctor_warnings() {
       printf '%b pid %s (%s) stuck "%s" %s — phone approval lost\n' \
         "$GLYPH_ALERT" "$pid" "$(short_home "$cwd")" "$(truncate_str "$status" 18)" "$(ms_relative "$updated_ms")"
       n=$((n+1))
+      _di_add "stalled" "warning" "$pid" "" \
+        "pid $pid ($cwd) stuck \"$status\" — phone approval lost"
     fi
   done < <(awk -F '\t' '{print $2"\t"$3"\t"$5"\t"$8"\t"$9}' <<<"$rows")
 
@@ -641,6 +677,8 @@ _doctor_warnings() {
       printf '%b stale: %s/%s.json (pid gone, %s)\n' \
         "$GLYPH_DASH" "$(short_home "$stale_sdir")" "$pid" "$(short_home "$cwd")"
       n=$((n+1))
+      _di_add "stale" "info" "$pid" "" \
+        "stale: $stale_sdir/$pid.json (pid gone, $cwd)"
     fi
   done < <(awk -F '\t' '{print $2"\t"$3"\t"$9"\t"$10}' <<<"$rows")
 
@@ -657,7 +695,13 @@ _doctor_warnings() {
   # orphan is classified via _orphan_activity BEFORE anything is shown, and
   # the summary + per-line markers reflect what --reap would actually be safe
   # to touch.
-  local orphan_rows; orphan_rows="$(_orphan_rows || true)"
+  #
+  # ONE process-table snapshot for both check (6) and check (7) below — they
+  # read the identical table, and this call used to happen twice (once
+  # inside each of _orphan_rows/_stuck_build_rows), doubling `ps`'s cost on
+  # every `ls`/`doctor` for no reason.
+  local ps_rows; ps_rows="$(_ps_snapshot_rows || true)"
+  local orphan_rows; orphan_rows="$(_orphan_rows "$ps_rows" || true)"
   if [[ -n "$orphan_rows" ]]; then
     local orphan_count total_cpu
     orphan_count="$(wc -l <<<"$orphan_rows")"
@@ -673,9 +717,13 @@ _doctor_warnings() {
         _oa_status[$pid]="active"
         _oa_reason[$pid]="${act#active$'\t'}"
         busy_count=$((busy_count+1))
+        _di_add "orphan-process" "info" "$pid" "" \
+          "orphaned dev process $pid ($(_short_cmd "$args")), $(_fmt_age_hm "$etimes") — active (${_oa_reason[$pid]}), reap will skip it"
       else
         _oa_status[$pid]="idle"
         reapable_count=$((reapable_count+1))
+        _di_add "orphan-process" "warning" "$pid" "" \
+          "orphaned dev process $pid ($(_short_cmd "$args")), $(_fmt_age_hm "$etimes") — reapable"
       fi
     done <<<"$orphan_rows"
 
@@ -702,7 +750,7 @@ _doctor_warnings() {
 
   # (7) Stuck builds (*:build), regardless of parentage — a plugin/package
   # build takes seconds; one running 10+ minutes is hung.
-  local stuck_rows; stuck_rows="$(_stuck_build_rows || true)"
+  local stuck_rows; stuck_rows="$(_stuck_build_rows "$ps_rows" || true)"
   if [[ -n "$stuck_rows" ]]; then
     local stuck_count oldest
     stuck_count="$(wc -l <<<"$stuck_rows")"
@@ -710,6 +758,12 @@ _doctor_warnings() {
     printf '%b %d stuck build process(es) — *:build running >10m (oldest %s) — a build this long is hung\n' \
       "$GLYPH_ALERT" "$stuck_count" "$(_fmt_age_hm "$oldest")"
     n=$((n+1))
+    local sb_pid sb_etimes sb_pcpu sb_comm sb_args
+    while IFS=$'\t' read -r sb_pid sb_etimes sb_pcpu sb_comm sb_args; do
+      [[ -z "$sb_pid" ]] && continue
+      _di_add "stuck-build" "warning" "$sb_pid" "" \
+        "stuck build $sb_pid ($(_short_cmd "$sb_args")), running $(_fmt_age_hm "$sb_etimes") — a build this long is hung"
+    done <<<"$stuck_rows"
   fi
 
   # (8) Title index health. A degraded cache never announces itself any other
@@ -721,7 +775,62 @@ _doctor_warnings() {
     n=$((n + $(wc -l <<<"$ti_out")))
   fi
 
+  # (9) Upstream session-state schema drift (see _doctor_upstream_fields).
+  # Neither this check nor (8) feeds _DOCTOR_ISSUES: both are cache/schema
+  # health, not a per-session or per-process issue, and lib/json.sh's
+  # issues/processes sections (checks 1-7 only) never claim to cover them.
+  local uf_out; uf_out="$(_doctor_upstream_fields || true)"
+  if [[ -n "$uf_out" ]]; then
+    printf '%s\n' "$uf_out"
+    n=$((n + $(wc -l <<<"$uf_out")))
+  fi
+
   return "$n"
+}
+
+# Upstream session-state schema drift, check (9). ONE batched jq call across
+# every account's sessions/*.json (never one per file — that would refork jq
+# once per session file, exactly the anti-pattern _session_rows was fixed
+# for), diffed against the known field set. Reports each unseen key once.
+#
+# Deliberately ONE-DIRECTIONAL: the brief's counterpart — report a KNOWN field
+# missing from N file(s) — is NOT implemented. More than half of the known set
+# (waitingFor, and two of the three timestamp aliases statusUpdatedAt/
+# updatedAt/startedAt) are legitimately, routinely absent from a healthy file
+# by this very codebase's own understanding of the schema (_SESSION_JQ's `def
+# d` comment documents exactly this: a missing waitingFor and a "" bridge are
+# both normal, not defects). Implementing "missing known field = issue"
+# literally would flag almost every session file in existence — including
+# every fixture already in this suite (fake_session never sets any of those
+# three) — turning "all clear" into a permanent false positive across
+# test_ls_doctor_multiaccount.sh and test_doctor_orphans.sh. Only the
+# unknown-field direction (real, unambiguous schema growth) is implemented.
+_DOCTOR_KNOWN_SESSION_FIELDS="pid cwd entrypoint status waitingFor sessionId bridgeSessionId statusUpdatedAt updatedAt startedAt"
+_doctor_upstream_fields() {
+  shopt -s nullglob
+  local -a files=()
+  local acct dir f
+  while IFS=$'\t' read -r acct dir; do
+    for f in "$dir/sessions"/*.json; do
+      [[ -f "$f" ]] && files+=("$f")
+    done
+  done < <(_all_accounts)
+  # `jq` with no file arguments reads stdin and hangs — never let an empty
+  # glob (no accounts, or none with a sessions dir yet) reach it.
+  (( ${#files[@]} )) || return 0
+  local keys
+  keys="$(jq -rs '[.[] | keys[]] | unique | .[]' "${files[@]}" 2>/dev/null || true)"
+  [[ -n "$keys" ]] || return 0
+  local k
+  while IFS= read -r k; do
+    [[ -z "$k" ]] && continue
+    case " $_DOCTOR_KNOWN_SESSION_FIELDS " in
+      *" $k "*) continue ;;
+    esac
+    printf "%b unknown session-state field '%s' (upstream schema changed — claude-session may be missing data)\n" \
+      "$GLYPH_ALERT" "$k"
+  done <<<"$keys"
+  return 0
 }
 
 # Title index check (8) for _doctor_warnings above. Runs unconditionally — the
@@ -804,6 +913,7 @@ declare -a IDX_SESS IDX_PID IDX_CWD IDX_SID IDX_ACCOUNT
 LS_COUNT=0   # number of cards rendered by the last cmd_ls (consumed by resume)
 
 cmd_ls() {
+  if (( JSON_OUT == 1 )); then _json_envelope "chats,issues"; return $?; fi
   LS_COUNT=0
   local rows; rows="$(_session_rows || true)"
   if [[ -z "$rows" ]]; then
@@ -840,13 +950,20 @@ cmd_ls() {
 
     # line 1: [N] glyph SESSION  pid PID  RAM  CWD  [account]
     local proj; proj="$(short_home "$cwd")"
-    local ram_mb; ram_mb="$(_pid_ram_mb "$pid")"
-    local ram_col="$N"
-    (( ram_mb > 800 )) && ram_col="$R" || { (( ram_mb > 400 )) && ram_col="$Y"; }
+    # _rss_get (lib/json.sh) reads the same _RAM_KB_CACHE _pid_ram_mb does, but
+    # says so honestly: "unknown" (rendered "?") for a pid the batch `ps`
+    # never reported, never a 0 that reads exactly like "verified zero RAM".
+    local ram_mb; ram_mb="$(_rss_get "$pid")"
+    local ram_disp="$ram_mb" ram_col="$N"
+    if [[ "$ram_mb" =~ ^[0-9]+$ ]]; then
+      (( ram_mb > 800 )) && ram_col="$R" || { (( ram_mb > 400 )) && ram_col="$Y"; }
+    else
+      ram_disp="?"
+    fi
     local acct_tag=""
     [[ "$account" != "default" ]] && acct_tag="$(printf '  %b[%s]%b' "$M" "$account" "$N")"
     box_line "$(printf '%b[%d]%b %b %b%s%b  %bpid%b %s  %b%sMB%b  %b%s%b%s' \
-      "$BOLD" "$i" "$N" "$glyph" "$BOLD" "$sess" "$N" "$DIM" "$N" "$pid" "$ram_col" "$ram_mb" "$N" "$C" "$proj" "$N" "$acct_tag")"
+      "$BOLD" "$i" "$N" "$glyph" "$BOLD" "$sess" "$N" "$DIM" "$N" "$pid" "$ram_col" "$ram_disp" "$N" "$C" "$proj" "$N" "$acct_tag")"
 
     # line 2: chat title (the human name of the conversation), badged if it
     # arrived here via `transfer` (ledger-backed provenance, not a guess).
@@ -1253,6 +1370,26 @@ _do_reap() {
 
 # ---- doctor ----------------------------------------------------------------
 cmd_doctor() {
+  # --json is its own, self-consistent contract: the exit code is derived from
+  # THIS document's own issues+processes item counts, not from the human
+  # path's `wc -l` line-count mechanism below (which counts decorative lines —
+  # a per-orphan detail line, a "…and N more", a "→ reap them" hint — that
+  # were never meant to be one-issue-per-line and are out of scope to
+  # renumber here). Both paths still agree on the one thing that matters:
+  # 0 issues means all clear, and a real issue always yields a positive exit.
+  if (( JSON_OUT == 1 )); then
+    local envdoc envrc
+    envdoc="$(_json_envelope "chats,issues,processes")"; envrc=$?
+    printf '%s\n' "$envdoc"
+    (( envrc != 0 )) && exit "$envrc"
+    local n
+    n="$(jq -n --argjson d "$envdoc" \
+      '($d.sections.issues.items // []) as $i | ($d.sections.processes.items // []) as $p | ($i|length) + ($p|length)' \
+      2>/dev/null)"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    (( n > 250 )) && n=250
+    exit "$n"
+  fi
   # Scan once, hand the result down — _doctor_warnings used to rescan on its
   # own, and the "all clear" branch below rescanned yet again just to print a
   # count. Same string both times, so this is not merely faster but strictly

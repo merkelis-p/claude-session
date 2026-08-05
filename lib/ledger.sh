@@ -28,6 +28,18 @@ fi
 # Every transcript in one account, newest first -> TR_SID / TR_PROJDIR, count in
 # TR_COUNT. Depth-2 glob on purpose: subagent transcripts live one level deeper
 # and are not independently resumable.
+#
+# ONE `stat` call for every file's mtime, not one `_file_mtime` (itself one
+# `stat` fork) PER FILE, and dirname/basename via parameter expansion, not the
+# external `dirname`/`basename` commands. The original shape forked THREE
+# external processes per transcript — fine for `transfer`'s own occasional,
+# human-initiated picker, but this function is also the chats section's
+# window enumeration (lib/json.sh's `_sid_transcript_map`), where it runs on
+# every poll: measured on a 200-transcript account, the old shape cost ~600
+# execve calls and several SECONDS, blowing the ≤400ms poll budget on this
+# step alone before a single row was even built. Output is byte-identical —
+# same TR_SID/TR_PROJDIR content and order, same TR_COUNT/TR_TOTAL — only the
+# cost changed.
 declare -a TR_SID TR_PROJDIR
 TR_COUNT=0
 TR_TOTAL=0
@@ -35,20 +47,41 @@ _build_transfer_index() {
   local acct_dir="$1" limit="${2:-0}"
   TR_SID=(); TR_PROJDIR=(); TR_COUNT=0; TR_TOTAL=0
   shopt -s nullglob
-  local f rows="" i=0
+  local -a files=()
+  local f
   for f in "$acct_dir/projects"/*/*.jsonl; do
-    [[ -f "$f" ]] || continue
-    rows+="$(printf '%s\t%s' "$(_file_mtime "$f" || echo 0)" "$f")"$'\n'
+    [[ -f "$f" ]] && files+=("$f")
   done
+  # Explicit `return 0`, not a bare `return`: a bare one would return the
+  # exit status of the failing `((...))` test that triggered it (1, since
+  # `((0))` is false) — turning "no transcripts, nothing to do" into a
+  # reported FAILURE. `set -e` then aborted the caller's entire script on
+  # this line for an empty account, silently, before any output — that
+  # regression is exactly why this is spelled out rather than left implicit.
+  (( ${#files[@]} )) || return 0
+
+  local rows=""
+  local sm sf
+  while IFS=$'\t' read -r sm sf; do
+    [[ -z "$sf" ]] && continue
+    rows+="$sm"$'\t'"$sf"$'\n'
+  done < <(
+    case "$(_compat_os)" in
+      darwin) stat -f $'%m\t%N' "${files[@]}" 2>/dev/null ;;
+      *)      stat -c $'%Y\t%n' "${files[@]}" 2>/dev/null ;;
+    esac
+  )
   [[ -z "$rows" ]] && return
+
+  local i=0
   while IFS=$'\t' read -r _mtime f; do
     [[ -z "$f" ]] && continue
     TR_TOTAL=$((TR_TOTAL+1))
     # Keep counting past the cap so the caller can report what it didn't show.
     (( limit > 0 && i >= limit )) && continue
     i=$((i+1))
-    TR_SID[$i]="$(basename "$f" .jsonl)"
-    TR_PROJDIR[$i]="$(dirname "$f")"
+    TR_SID[$i]="${f##*/}"; TR_SID[$i]="${TR_SID[$i]%.jsonl}"
+    TR_PROJDIR[$i]="${f%/*}"
   done < <(sort -rn <<<"$rows")
   TR_COUNT="$i"
 }

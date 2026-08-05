@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `ls --json` and `doctor --json`, backed by new `chats`/`issues`/`processes`
+  JSON sections (per-chat runtime, title, and provenance state; the five
+  session-state checks; orphan/stuck-build processes). `doctor --json` keeps
+  the existing exit-code contract (its exit status is the issue count).
+- `doctor` gained an upstream session-state schema-drift check: an unrecognized
+  field in a `sessions/*.json` file (Claude Code writing something this build
+  doesn't know about yet) is now reported by name instead of silently ignored.
+  **Note:** this means `doctor`'s issue count can go from 0 to 1 the first time
+  Claude Code's session-state schema changes upstream, even with nothing
+  otherwise wrong — the exit-code *contract* (0 = all clear) is unchanged, but
+  a monitor alerting on `>0` will see this new check the same as any other.
+
 ## [0.1.0] - 2026-07-27
 
 ### Added

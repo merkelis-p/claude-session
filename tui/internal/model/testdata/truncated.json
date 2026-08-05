@@ -1,0 +1,14 @@
+{
+  "core": {
+    "bash": "5.2.21(1)-release",
+    "elapsedMsPrecision": "ms",
+    "lib": "/home/u/.local/share/claude-helpers",
+    "platform": "linux",
+    "version": "0.2.0"
+  },
+  "elapsedMs": 259,
+  "generatedAt": 1785927057,
+  "schemaVersion": 1,
+  "sections": {
+    "accounts": {
+      "checks

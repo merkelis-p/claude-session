@@ -1,0 +1,3 @@
+claude-session: internal error — an emitter produced invalid JSON
+Traceback (most recent call last):
+  this is a stray error page, not an envelope at all.

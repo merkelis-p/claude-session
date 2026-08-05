@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 99,
+  "generatedAt": 1785927058,
+  "elapsedMs": 1,
+  "core": {
+    "version": "0.2.0",
+    "platform": "linux",
+    "bash": "5.2.21(1)-release",
+    "lib": "/home/u/.local/share/claude-helpers",
+    "elapsedMsPrecision": "ms"
+  },
+  "sections": "a future major schema could shape this section object however it likes — Decode must never look here to reject schemaVersion 99, only at the version above"
+}

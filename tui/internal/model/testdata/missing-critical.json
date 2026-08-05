@@ -1,0 +1,93 @@
+{
+  "core": {
+    "bash": "5.2.21(1)-release",
+    "elapsedMsPrecision": "ms",
+    "lib": "/home/u/.local/share/claude-helpers",
+    "platform": "linux",
+    "version": "0.2.0"
+  },
+  "elapsedMs": 210,
+  "generatedAt": 1785927059,
+  "schemaVersion": 1,
+  "sections": {
+    "accounts": {
+      "checksRun": ["registry", "credentials"],
+      "checksSkipped": [],
+      "errors": [],
+      "items": [
+        {"credentials": false, "description": "", "dir": "/home/u/.claude", "name": "default"}
+      ],
+      "status": "ok"
+    },
+    "chats": {
+      "checksRun": ["transcripts", "runtime", "provenance", "titles-index"],
+      "checksSkipped": [],
+      "degraded": 1,
+      "errors": [],
+      "items": [
+        {
+          "account": "",
+          "accountDir": "",
+          "cwd": null,
+          "degraded": true,
+          "degradedReason": "sessionId account accountDir transcriptPath runtime.pid runtime.alive",
+          "flags": [],
+          "mtime": 1785927059,
+          "provenance": null,
+          "runtime": {
+            "alive": null,
+            "attachable": false,
+            "bridgeSessionId": null,
+            "entrypoint": "claude",
+            "pid": null,
+            "present": true,
+            "rss": {"state": "unknown", "value": null},
+            "status": "idle",
+            "statusAgeSec": null,
+            "tmux": "(detached)"
+          },
+          "sessionId": null,
+          "title": {"source": "none", "state": "unknown", "value": ""},
+          "transcriptPath": null,
+          "transcriptPathSource": ""
+        }
+      ],
+      "limit": 200,
+      "status": "partial",
+      "titlesIndex": {"pending": 0, "resolved": 0, "state": "cold"},
+      "total": 1,
+      "truncated": false
+    },
+    "issues": {
+      "checksRun": ["same-chat-twice", "rc-bridge-shared", "duplicate-bridge", "stalled", "stale", "title-index", "upstream-field"],
+      "checksSkipped": [],
+      "errors": [],
+      "items": [],
+      "status": "ok"
+    },
+    "ledger": {
+      "checksRun": ["ledger", "endpoints", "divergence"],
+      "checksSkipped": [{"name": "endpoints", "reason": "no ledger file yet"}],
+      "errors": [],
+      "items": [],
+      "limit": 0,
+      "status": "ok",
+      "total": 0,
+      "truncated": false
+    },
+    "processes": {
+      "checksRun": ["orphan-process", "stuck-build"],
+      "checksSkipped": [],
+      "errors": [],
+      "items": [],
+      "status": "ok"
+    },
+    "schedules": {
+      "checksRun": ["schedules", "timers"],
+      "checksSkipped": [{"name": "timers", "reason": "no schedules to join fire times against"}],
+      "errors": [],
+      "items": [],
+      "status": "ok"
+    }
+  }
+}

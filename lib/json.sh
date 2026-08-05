@@ -246,12 +246,17 @@ _rss_get() {
 # session-state file that has lost its sessionId) — the emitted
 # transcriptPathSource distinguishes the two: a cwd fallback is a guess and
 # the app renders it as one.
-declare -A _SIDPATH=()
+declare -A _SIDPATH=() _SIDMETA=()
 _sid_transcript_map() {
   local acct_dir="$1" limit="${2:-$CHAT_LIMIT}" i
   _build_transfer_index "$acct_dir" "$limit"
   for (( i=1; i<=TR_COUNT; i++ )); do
-    _SIDPATH[${TR_SID[$i]}]="${TR_PROJDIR[$i]}/${TR_SID[$i]}.jsonl"
+    local p="${TR_PROJDIR[$i]}/${TR_SID[$i]}.jsonl"
+    _SIDPATH[${TR_SID[$i]}]="$p"
+    # mtime+size came free from the index build's own stat — carry them keyed by
+    # path so the section does not stat these files a second time for the
+    # title-index key. Fallback paths (not in the index) still get statted below.
+    _SIDMETA[$p]="${TR_MTIME[$i]}"$'\t'"${TR_SIZE[$i]}"
   done
 }
 
@@ -293,7 +298,7 @@ _json_section_chats() {
 
   while IFS=$'\t' read -r acct dir; do
     [[ -n "$acct" ]] || continue
-    _SIDPATH=()
+    _SIDPATH=(); _SIDMETA=()
     _sid_transcript_map "$dir" "$CHAT_LIMIT"
     total=$(( total + TR_TOTAL ))
 
@@ -338,15 +343,25 @@ _json_section_chats() {
       else src_of[$k]=""; fi
     done
 
-    # mtime+size for the WHOLE account's resolved paths, ONE stat call — not
-    # one per row (see lib/titleindex.sh's _titles_window for why this
-    # matters: the exact anti-pattern that took a warm 200-row window from
-    # 93ms to 3.9s was one fork per row, not one fork for the row).
+    # mtime+size for every resolved path. The window's bulk (everything the
+    # index build enumerated) already carries (mtime,size) from that build's
+    # own stat — seed from _SIDMETA and stat ONLY the leftover: fallback paths
+    # resolved via _transcript_for_sid, which the index did not cover and which
+    # are normally a tiny handful (VS Code, or a session-state file that lost
+    # its sessionId). This is still ONE stat call, now over that small set
+    # instead of a full duplicate pass over all 200 window files (~50ms saved).
+    local -A m_of=() sz_of=()
     local -a stat_files=()
     for k in "${sids[@]}"; do
-      [[ -n "${path_of[$k]:-}" ]] && stat_files+=("${path_of[$k]}")
+      local pk="${path_of[$k]:-}"
+      [[ -n "$pk" ]] || continue
+      local meta="${_SIDMETA[$pk]:-}"
+      if [[ -n "$meta" ]]; then
+        m_of[$pk]="${meta%%$'\t'*}"; sz_of[$pk]="${meta#*$'\t'}"
+      else
+        stat_files+=("$pk")
+      fi
     done
-    local -A m_of=() sz_of=()
     if (( ${#stat_files[@]} > 0 )); then
       local sp sm ssz
       while IFS=$'\t' read -r sp sm ssz; do

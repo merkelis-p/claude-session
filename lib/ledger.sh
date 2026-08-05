@@ -40,12 +40,12 @@ fi
 # step alone before a single row was even built. Output is byte-identical —
 # same TR_SID/TR_PROJDIR content and order, same TR_COUNT/TR_TOTAL — only the
 # cost changed.
-declare -a TR_SID TR_PROJDIR
+declare -a TR_SID TR_PROJDIR TR_MTIME TR_SIZE
 TR_COUNT=0
 TR_TOTAL=0
 _build_transfer_index() {
   local acct_dir="$1" limit="${2:-0}"
-  TR_SID=(); TR_PROJDIR=(); TR_COUNT=0; TR_TOTAL=0
+  TR_SID=(); TR_PROJDIR=(); TR_MTIME=(); TR_SIZE=(); TR_COUNT=0; TR_TOTAL=0
   shopt -s nullglob
   local -a files=()
   local f
@@ -60,21 +60,27 @@ _build_transfer_index() {
   # regression is exactly why this is spelled out rather than left implicit.
   (( ${#files[@]} )) || return 0
 
+  # mtime AND size in the one stat. Size costs nothing extra here (the inode is
+  # already being read for mtime) and it spares every caller a second stat over
+  # the same files: the chats section needs (mtime,size) for the title-index
+  # key, and used to re-stat all 200 window files just for the size — a full
+  # duplicate pass measured at ~50ms. mtime stays first so `sort -rn` still
+  # orders by it.
   local rows=""
-  local sm sf
-  while IFS=$'\t' read -r sm sf; do
+  local sm ssz sf
+  while IFS=$'\t' read -r sm ssz sf; do
     [[ -z "$sf" ]] && continue
-    rows+="$sm"$'\t'"$sf"$'\n'
+    rows+="$sm"$'\t'"$ssz"$'\t'"$sf"$'\n'
   done < <(
     case "$(_compat_os)" in
-      darwin) stat -f $'%m\t%N' "${files[@]}" 2>/dev/null ;;
-      *)      stat -c $'%Y\t%n' "${files[@]}" 2>/dev/null ;;
+      darwin) stat -f $'%m\t%z\t%N' "${files[@]}" 2>/dev/null ;;
+      *)      stat -c $'%Y\t%s\t%n' "${files[@]}" 2>/dev/null ;;
     esac
   )
   [[ -z "$rows" ]] && return
 
   local i=0
-  while IFS=$'\t' read -r _mtime f; do
+  while IFS=$'\t' read -r _mtime _size f; do
     [[ -z "$f" ]] && continue
     TR_TOTAL=$((TR_TOTAL+1))
     # Keep counting past the cap so the caller can report what it didn't show.
@@ -82,6 +88,7 @@ _build_transfer_index() {
     i=$((i+1))
     TR_SID[$i]="${f##*/}"; TR_SID[$i]="${TR_SID[$i]%.jsonl}"
     TR_PROJDIR[$i]="${f%/*}"
+    TR_MTIME[$i]="$_mtime"; TR_SIZE[$i]="$_size"
   done < <(sort -rn <<<"$rows")
   TR_COUNT="$i"
 }

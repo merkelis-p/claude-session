@@ -190,6 +190,20 @@ _ledger_append() {
 }
 
 # Pre-transfer guard. Args: sid from to dst_exists(0|1). 0=proceed, non-zero=refuse.
+#
+# Two conditions live here — "already transferred this before" (duplicate) and
+# "this reverses an earlier transfer" (round-trip) — and both used to be a flat
+# refusal requiring --force, with no distinction between a script and a human
+# at a terminal. Now: interactive keeps its exact old behavior (round-trip
+# still prompts [y/N]; duplicate still hard-refuses, it never prompted). Non-
+# interactive without --dry-run/--yes ALSO keeps its exact old behavior (hard
+# refuse, same text, --force is the only way through) — a bare script call
+# that never opted into the plan/apply protocol must not silently start
+# behaving differently. Only under --dry-run or --yes do these become
+# _plan_confirm entries instead: a condition the human can review and satisfy
+# with --ack=<digest>, the lighter-weight alternative to --force this task
+# adds. --force still short-circuits both branches before either check runs,
+# unchanged.
 _ledger_guard() {
   local sid="$1" from="$2" to="$3" dst_exists="$4"
   [[ -f "$LEDGER_FILE" ]] || return 0
@@ -199,8 +213,13 @@ _ledger_guard() {
       'select(.sid==$s and .to==$t and (.verb=="move" or .verb=="copy")) | "\(.ts)\t\(.verb)"' \
       "$LEDGER_FILE" 2>/dev/null | tail -1)"
     if [[ -n "$prior" && "$FORCE" == 0 ]]; then
-      echo "claude-session transfer: already transferred ($(cut -f2 <<<"$prior")) $sid → $to on $(_epoch_to_human "$(cut -f1 <<<"$prior")" '+%Y-%m-%d %H:%M' || echo '?') — refusing to duplicate (use --force)" >&2
-      return 2
+      local dtext="already transferred ($(cut -f2 <<<"$prior")) $sid → $to on $(_epoch_to_human "$(cut -f1 <<<"$prior")" '+%Y-%m-%d %H:%M' || echo '?') — refusing to duplicate (use --force)"
+      if (( DRY_RUN == 1 || ASSUME_YES == 1 )); then
+        _plan_confirm duplicate "$dtext"
+      else
+        echo "claude-session transfer: $dtext" >&2
+        return 2
+      fi
     fi
   fi
   local rt
@@ -209,12 +228,18 @@ _ledger_guard() {
     "$LEDGER_FILE" 2>/dev/null | tail -1)"
   if [[ -n "$rt" ]]; then
     [[ "$FORCE" == 1 ]] && return 0
-    if ! _cs_interactive; then
-      echo "claude-session transfer: round-trip detected ($to → $from earlier) — re-run with --force to confirm" >&2
-      return 2
+    if _cs_interactive; then
+      printf 'round-trip: %s was moved %s → %s before. Send it back %s → %s? [y/N] ' "$sid" "$to" "$from" "$from" "$to" >&2
+      local ans; read -r ans; [[ "$ans" == [yY] ]] || { echo "cancelled" >&2; return 2; }
+    else
+      local rtext="round-trip detected ($to → $from earlier) — re-run with --force to confirm"
+      if (( DRY_RUN == 1 || ASSUME_YES == 1 )); then
+        _plan_confirm round-trip "$rtext"
+      else
+        echo "claude-session transfer: $rtext" >&2
+        return 2
+      fi
     fi
-    printf 'round-trip: %s was moved %s → %s before. Send it back %s → %s? [y/N] ' "$sid" "$to" "$from" "$from" "$to" >&2
-    local ans; read -r ans; [[ "$ans" == [yY] ]] || { echo "cancelled" >&2; return 2; }
   fi
   return 0
 }
@@ -371,9 +396,16 @@ cmd_transfer() {
   # and then silently run its ordinary interactive path, discarding the
   # --json request instead of erroring on it: the same failure mode
   # cmd_accounts already guards against for `accounts add/rm --json`.
+  # --dry-run/--yes are the plan/apply protocol's own use of --json: --dry-run
+  # asks for the plan, --yes asks for its re-emission on an unmet confirmation
+  # (exit 3). Only the plain sid-based call builds a plan — undo/redo/prune
+  # don't, and stay refused exactly as before.
   if (( JSON_OUT == 1 )) && [[ "${1:-}" != "log" ]]; then
-    echo "claude-session: --json is not available for 'transfer ${1:-}' in this build" >&2
-    exit 2
+    if [[ "${1:-}" == "undo" || "${1:-}" == "redo" || "${1:-}" == "prune" ]] \
+       || (( DRY_RUN == 0 && ASSUME_YES == 0 )); then
+      echo "claude-session: --json is not available for 'transfer ${1:-}' in this build" >&2
+      exit 2
+    fi
   fi
   case "${1:-}" in
     log)   shift; cmd_transfer_log "$@"; return ;;
@@ -444,14 +476,39 @@ cmd_transfer() {
   src_hist="$src_dir/file-history/$sid"
   dst_hist="$dst_dir/file-history/$sid"
 
+  local verb="copied" verbword="copy"
+  if (( TRANSFER_MOVE == 1 )); then verb="moved"; verbword="move"; fi
+
+  # ---- build the plan (advisory only) ----------------------------------------
+  # Every guard below re-runs for real regardless of what the plan says — this
+  # is only so --json/--dry-run and the human-readable refusal/confirmation
+  # text come from the same source. See lib/plan.sh's header for the protocol.
+  _plan_reset "transfer.$verbword"
+  _plan_argv claude-session transfer "$sid" "--to=$to" "--from=$from"
+  (( TRANSFER_MOVE == 1 )) && _plan_argv --move
+  _plan_target "$to" "$sid" "$(_title_for_file "$src_jsonl" 2>/dev/null)" "$dst_jsonl"
+  _plan_effect write "$dst_jsonl"
+  if (( TRANSFER_MOVE == 1 )); then
+    _plan_effect remove "$src_jsonl"
+    _plan_will_lose "the source copy under '$from' (reversible: claude-session transfer undo <id>)"
+  fi
+
   # dst_jsonl's own existence is now the ledger's job (_ledger_guard, below —
   # it distinguishes "already transferred this before" from a foreign file and
   # says so specifically). The file-history sidecar isn't ledger-tracked, so it
   # keeps its own never-clobber check here.
+  #
+  # This refusal (like the backstop below) is unconditional: only --force can
+  # ever satisfy it, never --ack — an --ack confirms a DISCLOSED condition, and
+  # "the destination already has bytes you'd overwrite" is not something an
+  # ack should be able to wave through. So it always records into the plan AND
+  # keeps its old stderr text, but never exits here directly — that decision
+  # is centralized below so --dry-run can still finish building (and flush) a
+  # plan that discloses the refusal instead of dying before it prints one.
   if (( FORCE == 0 )); then
     if [[ -e "$src_hist" && -e "$dst_hist" ]]; then
       echo "claude-session transfer: $(short_home "$dst_hist") already exists — refusing to overwrite (use --force)" >&2
-      exit 2
+      _plan_refuse 2 "$(short_home "$dst_hist") already exists — refusing to overwrite" "--force"
     fi
   fi
 
@@ -459,14 +516,29 @@ cmd_transfer() {
   _ledger_guard "$sid" "$from" "$to" "$dst_exists" || exit $?
 
   # Backstop: never clobber an existing destination transcript without --force,
-  # even when no ledger entry explains it (post-prune, manual dst, or no ledger yet).
+  # even when no ledger entry explains it (post-prune, manual dst, or no ledger
+  # yet). Same reasoning as the file-history check above: --force only, and
+  # deferred to the unified check below rather than exiting here.
   if (( FORCE == 0 && dst_exists == 1 )); then
     echo "claude-session transfer: $(short_home "$dst_jsonl") already exists — refusing to overwrite (use --force)" >&2
-    exit 2
+    _plan_refuse 2 "$(short_home "$dst_jsonl") already exists — refusing to overwrite" "--force"
   fi
 
-  local verb="copied" verbword="copy"
-  if (( TRANSFER_MOVE == 1 )); then verb="moved"; verbword="move"; fi
+  # ---- the one place every path above converges ------------------------------
+  # --dry-run always ends here, before a single byte moves. --yes must clear
+  # every disclosed confirmation (an --ack of a stale digest is not an ack —
+  # _plan_require_acks re-hashes and checks the CURRENT plan, so a plan that
+  # changed between plan and apply cannot be satisfied by an old one). Refusals
+  # (file-history/backstop above, or anything _ledger_guard added in bare
+  # non-interactive mode never reaches here — it already exited via `|| exit
+  # $?` above with the OLD, unchanged behavior) are a first-class result, not a
+  # crash: --json still gets a document to parse even on exit 2.
+  if (( DRY_RUN == 1 )); then _plan_flush; exit 0; fi
+  if (( ASSUME_YES == 1 )); then _plan_require_acks; fi
+  if (( ${#PLAN_REFUSE_CODE[@]} > 0 )); then
+    (( JSON_OUT == 1 )) && _plan_flush
+    exit 2
+  fi
 
   # Durability gate: record BEFORE mutating the source. Title snapshot from the
   # source, which still exists at this point.

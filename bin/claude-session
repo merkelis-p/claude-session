@@ -124,6 +124,7 @@ set -euo pipefail
 . "$CLAUDE_HELPERS_LIB/schedule.sh"
 . "$CLAUDE_HELPERS_LIB/titleindex.sh"
 . "$CLAUDE_HELPERS_LIB/json.sh"
+. "$CLAUDE_HELPERS_LIB/plan.sh"
 
 # ---- account registry -------------------------------------------------------
 # ~/.config/claude-helpers/accounts.conf registers extra Claude Code accounts,

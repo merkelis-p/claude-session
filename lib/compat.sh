@@ -165,3 +165,19 @@ _timeout() {
   echo "claude-session: no timeout(1)/gtimeout found — running without a time cap (brew install coreutils)" >&2
   "$@"
 }
+
+# ---- content hashing --------------------------------------------------------
+# sha256 of stdin, hex. Not a security primitive: it binds an --ack to the exact
+# disclosure the human saw, so a plan that changed between plan and apply cannot
+# be satisfied by a stale ack. It therefore FAILS LOUDLY with no tool rather than
+# degrading to a weaker hash — a colliding digest would let an unseen
+# confirmation be acked, which is the one thing this mechanism exists to prevent.
+_sha256() {
+  if command -v sha256sum >/dev/null 2>&1;   then sha256sum | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1;    then shasum -a 256 | cut -d' ' -f1
+  elif command -v openssl >/dev/null 2>&1;   then openssl dgst -sha256 -r | cut -d' ' -f1
+  else
+    echo "claude-session: no sha256 tool (sha256sum, shasum or openssl) — cannot compute a confirmation digest" >&2
+    return 1
+  fi
+}

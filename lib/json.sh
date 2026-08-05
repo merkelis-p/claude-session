@@ -260,18 +260,33 @@ _sid_transcript_map() {
   done
 }
 
-# The titlesIndex object: _ti_stats' whole-cache counters (state, hits,
-# misses, entries, dupes, skipped, stale — note the trailing stale field,
-# absent from an earlier draft of this cache) plus THIS section's own
-# pending count (misses THIS window actually had, not the cache's lifetime
-# total — a section-scoped number a poller can act on directly).
+# The titlesIndex object, WINDOW-SCOPED on purpose. It carries only what this
+# poll can act on: how many of the window's rows resolved from the index
+# (`resolved`), how many missed and still need `_titles --sids=` (`pending`),
+# and a COARSE presence state.
+#
+# It deliberately does NOT call _ti_stats/_ti_load. Those read the entire
+# append-only index — one line per transcript, growing without compaction — in
+# a bash loop, measured at ~206ms on a 2,200-line index and ~760ms at 6,810.
+# That is O(total transcripts) on a path that must stay O(window): reading the
+# whole cache here to report lifetime `entries/dupes/stale` reintroduced the
+# exact cost the windowed design exists to avoid, right next to the window
+# lookup (_ti_lookup_window) that was written to avoid it. The whole-cache
+# health numbers still exist — `doctor`'s title-index check (8) computes them,
+# where an O(total) read once per manual `doctor` run is fine and a per-poll
+# read is not.
+#
+# `state` is derived from the header line alone (one `head -1`), never a full
+# parse: present-with-a-valid-header is "warm", anything else "cold". The
+# stale/corrupt distinction belongs to check (8), which does the full read.
 _json_titles_index_stats() {
-  local pending="${1:-0}" state hits misses entries dupes skipped stale
-  IFS=$'\t' read -r state hits misses entries dupes skipped stale <<<"$(_ti_stats)"
-  jq -n --arg st "$state" --argjson h "${hits:-0}" --argjson m "${misses:-0}" \
-        --argjson e "${entries:-0}" --argjson d "${dupes:-0}" --argjson s "${skipped:-0}" \
-        --argjson z "${stale:-0}" --argjson p "$pending" \
-    '{state:$st, hits:$h, misses:$m, entries:$e, dupes:$d, skipped:$s, stale:$z, pending:$p}'
+  local pending="${1:-0}" resolved="${2:-0}" state="cold"
+  if [[ -r "$TITLE_INDEX" ]]; then
+    local hdr; hdr="$(head -1 "$TITLE_INDEX" 2>/dev/null || true)"
+    [[ "$hdr" == "#v$TITLE_INDEX_VERSION "* ]] && state="warm"
+  fi
+  jq -n --arg st "$state" --argjson r "$resolved" --argjson p "$pending" \
+    '{state:$st, resolved:$r, pending:$p}'
 }
 
 CHAT_CRITICAL_FIELDS="sessionId account accountDir transcriptPath runtime.pid runtime.alive"
@@ -293,7 +308,7 @@ _json_section_chats() {
   _ledger_provenance_load
   _ram_load
   _compute_pid_flags "$src_rows"
-  local total=0 degraded=0 pending=0 rows=""
+  local total=0 degraded=0 pending=0 resolved=0 rows=""
   local acct dir
 
   while IFS=$'\t' read -r acct dir; do
@@ -404,6 +419,7 @@ _json_section_chats() {
         local hv="${hit["$fp"$'\t'"$m"$'\t'"$sz"]:-}"
         if [[ -n "$hv" ]]; then
           tstate="known"; tsource="${hv%%$'\x1f'*}"; tvalue="${hv#*$'\x1f'}"
+          resolved=$((resolved+1))
         else
           pending=$((pending+1))
         fi
@@ -525,7 +541,7 @@ _json_section_chats() {
   # per-row payload only ever travels through a pipe, which has no such limit.
   jq -Rn --argjson skipped "$(_json_skips_json)" \
         --argjson total "$total" --argjson limit "$CHAT_LIMIT" --argjson degraded "$degraded" \
-        --argjson idx "$(_json_titles_index_stats "$pending")" \
+        --argjson idx "$(_json_titles_index_stats "$pending" "$resolved")" \
     '[inputs | select(length>0) | split("\t") | {
         sessionId: (if .[0]=="" or .[0]=="-" then null else .[0] end),
         account: .[1],

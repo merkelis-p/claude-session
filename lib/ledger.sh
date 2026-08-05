@@ -63,33 +63,44 @@ _build_transfer_index() {
   # mtime AND size in the one stat. Size costs nothing extra here (the inode is
   # already being read for mtime) and it spares every caller a second stat over
   # the same files: the chats section needs (mtime,size) for the title-index
-  # key, and used to re-stat all 200 window files just for the size — a full
-  # duplicate pass measured at ~50ms. mtime stays first so `sort -rn` still
-  # orders by it.
-  local rows=""
-  local sm ssz sf
-  while IFS=$'\t' read -r sm ssz sf; do
-    [[ -z "$sf" ]] && continue
-    rows+="$sm"$'\t'"$ssz"$'\t'"$sf"$'\n'
-  done < <(
+  # key. mtime stays first so `sort -rn` orders by it.
+  #
+  # stat is piped STRAIGHT into sort — no intermediate bash loop copying the
+  # output into a string first. The two full-account bash `while read` loops
+  # this replaced (one to build that string, one to re-count and populate) each
+  # ran once per transcript in the ACCOUNT, so a poll paid ~700ms at 2,200
+  # transcripts and ~2s at 6,810 just marshalling rows in bash — O(total) work
+  # on a path the windowed design requires to be O(window). The raw data
+  # gathering under it is cheap (stat ~32ms, sort ~23ms); the loops were the
+  # cost, the same "loop in awk/coreutils, not in bash" lesson the title index
+  # already learned.
+  local sorted
+  sorted="$(
     case "$(_compat_os)" in
       darwin) stat -f $'%m\t%z\t%N' "${files[@]}" 2>/dev/null ;;
       *)      stat -c $'%Y\t%s\t%n' "${files[@]}" 2>/dev/null ;;
-    esac
-  )
-  [[ -z "$rows" ]] && return
+    esac | sort -rn
+  )"
+  # TR_TOTAL is the candidate count, taken from the glob — not re-derived by a
+  # second pass over the stat output. In the rare race where a file vanishes
+  # between the glob and the stat it is counted here but absent from `sorted`;
+  # reporting it in the total (it existed) is at least as correct as dropping
+  # it, and the alternative was a full-account bash loop purely to re-count.
+  TR_TOTAL=${#files[@]}
+  [[ -z "$sorted" ]] && return 0
 
-  local i=0
+  # Only the first `limit` rows need their fields split into the arrays, so this
+  # loop runs `limit` (~200) times, never TR_TOTAL. `head -n 0` prints NOTHING
+  # (not "everything"), so limit==0 (the unbounded rebuild) must bypass head.
+  local i=0 _mtime _size f
   while IFS=$'\t' read -r _mtime _size f; do
     [[ -z "$f" ]] && continue
-    TR_TOTAL=$((TR_TOTAL+1))
-    # Keep counting past the cap so the caller can report what it didn't show.
-    (( limit > 0 && i >= limit )) && continue
     i=$((i+1))
     TR_SID[$i]="${f##*/}"; TR_SID[$i]="${TR_SID[$i]%.jsonl}"
     TR_PROJDIR[$i]="${f%/*}"
     TR_MTIME[$i]="$_mtime"; TR_SIZE[$i]="$_size"
-  done < <(sort -rn <<<"$rows")
+    (( limit > 0 && i >= limit )) && break
+  done < <(if (( limit > 0 )); then head -n "$limit" <<<"$sorted"; else printf '%s\n' "$sorted"; fi)
   TR_COUNT="$i"
 }
 

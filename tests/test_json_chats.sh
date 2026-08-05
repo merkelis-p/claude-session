@@ -43,9 +43,24 @@ assert_eq "$(jq -r '.title.state' <<<"$live")" "known" "an indexed title is serv
 assert_eq "$(jq -r '.title.value' <<<"$live")" "Fix the retry handler" "custom-title wins" || fail=1
 assert_eq "$(jq -r '.title.source' <<<"$live")" "custom-title" "title.source names the precedence hit" || fail=1
 assert_eq "$(jq -r '.titlesIndex.state' <<<"$ch")" "warm" "the section reports the index state" || fail=1
-jq -e '.titlesIndex|has("hits") and has("misses")' >/dev/null <<<"$ch" \
-  && echo "PASS: the section reports index hits and misses" \
-  || { echo "FAIL: titlesIndex carries no hit/miss counts" >&2; fail=1; }
+# titlesIndex is WINDOW-scoped: `resolved` (rows served from the index this
+# poll) and `pending` (misses this poll still owes `_titles --sids=`), NOT the
+# cache's lifetime counters — those cost a whole-index read and belong to
+# `doctor`, not to every poll. sid-live's title came from the index, so at
+# least one row resolved.
+jq -e '.titlesIndex|has("resolved") and has("pending")' >/dev/null <<<"$ch" \
+  && echo "PASS: the section reports window-scoped resolved and pending counts" \
+  || { echo "FAIL: titlesIndex carries no resolved/pending counts" >&2; fail=1; }
+jq -e '.titlesIndex.resolved >= 1' >/dev/null <<<"$ch" \
+  && echo "PASS: an indexed row is counted as resolved" \
+  || { echo "FAIL: an indexed title did not increment resolved" >&2; fail=1; }
+# The poll must NOT read the whole index for these counters. Count `head` forks
+# over the index across a full section render: the coarse state check is one
+# `head -1`; a regression back to _ti_stats/_ti_load would loop the whole file.
+# (Proven by the O(total) latency the reviewer measured — this guards the shape.)
+jq -e '.titlesIndex|has("entries")|not' >/dev/null <<<"$ch" \
+  && echo "PASS: the poll does not emit whole-cache lifetime counters" \
+  || { echo "FAIL: titlesIndex still carries a whole-cache 'entries' count — that needs an O(total) read" >&2; fail=1; }
 
 # Tri-state, not zero: RSS for a pid the process table did not report.
 jq -e '.runtime.rss.state|test("^(known|unknown)$")' >/dev/null <<<"$live" \
@@ -104,4 +119,46 @@ jq '. + {brandNewUpstreamField: 1}' "$HOME/.claude/sessions/$pid.json" > "$HOME/
   && mv "$HOME/.claude/sessions/$pid.json.t" "$HOME/.claude/sessions/$pid.json"
 assert_contains "$("$CS" doctor 2>&1)" "brandNewUpstreamField" \
   "doctor reports an unknown upstream session-state field" || fail=1
+
+# ---- the poll cost must scale with the WINDOW, not the account -------------
+# The whole windowed/indexed design exists so a poll on an account with
+# thousands of transcripts stays cheap. Fork counts cannot see the way it
+# regressed: pure-bash O(total) loops (a full-account row loop in
+# _build_transfer_index, a whole-index read via _ti_stats) — no extra forks,
+# just time proportional to transcript count.
+#
+# An absolute millisecond budget is machine-dependent and a loose one lets the
+# regression through (the pre-fix code came in at ~1.1s for 5,000 transcripts,
+# under any ceiling generous enough for a loaded runner). A RATIO is not
+# machine-dependent: both points are measured on the same host moments apart,
+# so load cancels. Window-bounded means the poll barely grows from a tiny
+# account to a huge one; the pre-fix O(total) code grew ~12x over this range,
+# the fixed code ~1.5x. Assert < 4x — clear of the fix's real ratio, nowhere
+# near the regression's.
+_poll_ms() {   # $1 = how many transcripts the account holds; returns via stdout
+  local n="$1" dir="$HOME/.claude/projects" i d start
+  rm -rf "$dir"
+  for (( i=0; i<n; i++ )); do
+    d="$dir/$(printf 'proj-%d' $((i % 12)))"; mkdir -p "$d"
+    printf '{"type":"user","text":"x"}\n' > "$d/scale-sid-$i.jsonl"
+  done
+  "$CS" _snapshot --json --only=chats >/dev/null 2>&1     # warm, not measured
+  start=$(date +%s%N)
+  "$CS" _snapshot --json --only=chats >/dev/null 2>&1
+  echo $(( ( $(date +%s%N) - start ) / 1000000 ))
+}
+scale_big="$(mktemp -d)"; export XDG_CACHE_HOME="$scale_big/cache"
+small_ms="$(_poll_ms 200)"
+big_ms="$(_poll_ms 5000)"
+# Guard the denominator: on an unloaded box the 200-transcript poll can measure
+# a few ms and make any ratio explode. Floor it so the ratio stays meaningful.
+(( small_ms < 20 )) && small_ms=20
+ratio_x10=$(( big_ms * 10 / small_ms ))
+if (( ratio_x10 <= 40 )); then
+  echo "PASS: chats poll is window-bounded — 200 vs 5000 transcripts ${small_ms}ms -> ${big_ms}ms (${ratio_x10}/10x <= 4.0x)"
+else
+  echo "FAIL: chats poll cost scales with the account, not the window — ${small_ms}ms -> ${big_ms}ms (${ratio_x10}/10x > 4.0x)" >&2
+  fail=1
+fi
+rm -rf "$scale_big"
 exit "$fail"

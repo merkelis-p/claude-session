@@ -413,7 +413,13 @@ _json_section_chats() {
     # see the field's own comment below for why.
     for k in "${sids[@]}"; do
       local fp="${path_of[$k]:-}" psrc="${src_of[$k]:-}"
-      local m="${m_of[$fp]:-0}" sz="${sz_of[$fp]:-0}"
+      # Only index m_of/sz_of when fp is non-empty: `${m_of[""]}` is an empty
+      # associative-array subscript, which bash reports as "bad array subscript"
+      # on stderr even with a `:-0` default — a live runtime whose sid has no
+      # transcript on disk (VS Code, or a not-yet-flushed session) hits exactly
+      # that, leaking non-JSON noise into a `2>&1` caller's stream once per row.
+      local m="0" sz="0"
+      [[ -n "$fp" ]] && { m="${m_of[$fp]:-0}"; sz="${sz_of[$fp]:-0}"; }
       local tstate="unknown" tsource="none" tvalue=""
       if [[ -n "$fp" ]]; then
         local hv="${hit["$fp"$'\t'"$m"$'\t'"$sz"]:-}"
@@ -456,8 +462,15 @@ _json_section_chats() {
         [[ "$r" =~ ^[0-9]+$ ]] && { rssv="$r"; rsss="known"; }
       fi
 
+      # Provenance is a property of the CHAT (its transfer history in the
+      # ledger), keyed by sid#account independent of whether it is running now —
+      # so it is NOT gated on `present`. A transferred chat that has since been
+      # closed still carries where it came from; gating on a live runtime
+      # silently dropped that ledger fact for exactly the transcript-only rows a
+      # chats list is mostly made of. `$k` is the sid for a normal row (a
+      # sessionId-less runtime row keys on "-", which no ledger entry uses).
       local prov=""
-      if [[ "$present" == "true" && -n "$rpid" ]]; then
+      if [[ -n "$k" && "$k" != "-" ]]; then
         local pv="${XFER_BADGE["$k#$acct"]:-}"
         [[ -n "$pv" ]] && prov="transfer"$'\x1f'"${pv%%|*}"$'\x1f'"${pv#*|}"
       fi

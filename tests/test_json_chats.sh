@@ -15,6 +15,23 @@ fake_transcript "$HOME/.claude" "$HOME/web" "sid-old-2" '{"type":"last-prompt","
 
 doc="$(FORCE_COLOR=1 "$CS" _snapshot --json --only=chats,issues 2>/dev/null)"
 jq -e . >/dev/null 2>&1 <<<"$doc" || { echo "FAIL: invalid JSON: $doc" >&2; exit 1; }
+
+# A live runtime whose sid has NO transcript on disk (VS Code, or a session file
+# flushed before its transcript) must not leak "bad array subscript" — an empty
+# associative-array index survives `${arr[$x]:-0}` as a stderr error. Capture
+# stderr on its own and assert it is clean; the row must still appear (degraded,
+# never dropped).
+runtimeonly_pid="$(fake_session "$HOME/.claude" "$HOME/ghost" "session_NOFILE" "sid-nofile")"
+noise="$(FORCE_COLOR=1 "$CS" _snapshot --json --only=chats 2>&1 >/dev/null)"
+assert_not_contains "$noise" "bad array subscript" \
+  "a runtime with no transcript leaks no stderr noise into the section" || fail=1
+assert_not_contains "$noise" "unbound variable" \
+  "and no unbound-variable error either" || fail=1
+# and the ghost runtime is still represented, not silently dropped
+ghost="$(FORCE_COLOR=1 "$CS" _snapshot --json --only=chats 2>/dev/null | jq -c '.sections.chats.items[]|select(.sessionId=="sid-nofile")')"
+assert_eq "$(jq -r '.runtime.present' <<<"$ghost")" "true" "the transcript-less runtime is still shown" || fail=1
+# clean up so the counts below (which expect exactly the three seeded chats) hold
+rm -f "$HOME/.claude/sessions/$runtimeonly_pid.json"
 [[ "$doc" == *$'\033'* ]] && { echo "FAIL: chats/issues emitted ANSI" >&2; fail=1; } \
   || echo "PASS: chats/issues emit no ANSI under FORCE_COLOR=1"
 ch="$(jq -c '.sections.chats' <<<"$doc")"
@@ -76,6 +93,21 @@ assert_not_contains "$(jq -r '.title.value' <<<"$old")" "(untitled)" \
   "a miss is NEVER rendered as an untitled chat" || fail=1
 assert_contains "$(jq -r '.checksSkipped[].name' <<<"$ch")" "titles-window" \
   "titles not in the index are reported as a skipped check, with the pending count" || fail=1
+
+# Provenance is a property of the CHAT, not of a live runtime: a transferred
+# chat that is NOT currently running must still carry where it came from.
+# sid-old-1 is transcript-only (no runtime). Record a transfer into this account
+# for it, and assert the section surfaces it.
+: > "$HOME/.config/claude-helpers/transfer-log.jsonl"
+jq -cn '{id:"aaa111",ts:1785900000,sid:"sid-old-1",title:"Old one",from:"alpha",to:"default",verb:"move",undoOf:null,redoOf:null}' \
+  >> "$HOME/.config/claude-helpers/transfer-log.jsonl"
+docp="$(FORCE_COLOR=1 "$CS" _snapshot --json --only=chats 2>/dev/null)"
+oldp="$(jq -c '.sections.chats.items[]|select(.sessionId=="sid-old-1")' <<<"$docp")"
+assert_eq "$(jq -r '.runtime.present' <<<"$oldp")" "false" "the transferred chat is not running" || fail=1
+assert_eq "$(jq -r '.provenance.kind' <<<"$oldp")" "transfer" \
+  "a transcript-only chat still carries its transfer provenance (not gated on a live runtime)" || fail=1
+assert_eq "$(jq -r '.provenance.from' <<<"$oldp")" "alpha" "provenance names where it came from" || fail=1
+rm -f "$HOME/.config/claude-helpers/transfer-log.jsonl"
 jq -e '.titlesIndex.pending > 0' >/dev/null <<<"$ch" \
   && echo "PASS: the section counts how many titles are still unresolved" \
   || { echo "FAIL: titlesIndex.pending missing" >&2; fail=1; }
@@ -136,16 +168,25 @@ assert_contains "$("$CS" doctor 2>&1)" "brandNewUpstreamField" \
 # the fixed code ~1.5x. Assert < 4x — clear of the fix's real ratio, nowhere
 # near the regression's.
 _poll_ms() {   # $1 = how many transcripts the account holds; returns via stdout
-  local n="$1" dir="$HOME/.claude/projects" i d start
+  local n="$1" dir="$HOME/.claude/projects" i d start ms best=""
   rm -rf "$dir"
   for (( i=0; i<n; i++ )); do
     d="$dir/$(printf 'proj-%d' $((i % 12)))"; mkdir -p "$d"
     printf '{"type":"user","text":"x"}\n' > "$d/scale-sid-$i.jsonl"
   done
   "$CS" _snapshot --json --only=chats >/dev/null 2>&1     # warm, not measured
-  start=$(date +%s%N)
-  "$CS" _snapshot --json --only=chats >/dev/null 2>&1
-  echo $(( ( $(date +%s%N) - start ) / 1000000 ))
+  # Best of three: a load spike on a shared runner can only inflate a sample,
+  # never deflate it, so the minimum is the reading least polluted by contention
+  # — the honest measure of the code's own cost, and what keeps this ratio gate
+  # from flaking under load rather than catching a real regression.
+  local r
+  for r in 1 2 3; do
+    start=$(date +%s%N)
+    "$CS" _snapshot --json --only=chats >/dev/null 2>&1
+    ms=$(( ( $(date +%s%N) - start ) / 1000000 ))
+    { [[ -z "$best" ]] || (( ms < best )); } && best=$ms
+  done
+  echo "$best"
 }
 scale_big="$(mktemp -d)"; export XDG_CACHE_HOME="$scale_big/cache"
 small_ms="$(_poll_ms 200)"

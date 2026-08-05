@@ -97,19 +97,30 @@ _json_envelope() {
   # cache assigned INSIDE one of those dies with that subshell the instant it
   # exits — the only thing that actually works is computing the scan here,
   # in _json_envelope's own (non-subshell) frame, and passing the resulting
-  # STRING down as an argument. chats needs the session-state scan; issues
-  # and processes need both the scan AND one _doctor_warnings pass (which
-  # itself consumes that same scan) to populate _DOCTOR_ISSUES — computed
-  # once here and serialized to a string, since _DOCTOR_ISSUES (a bash array)
+  # STRING down as an argument. chats and issues need the session-state scan
+  # (_session_rows); processes needs the OS-process-table scan
+  # (_ps_snapshot_rows) instead — it has no Claude-session dependency at all,
+  # unlike the OLD processes section this replaces, which only ever re-served
+  # _DOCTOR_ISSUES text. issues ALSO needs one _doctor_warnings pass (which
+  # itself consumes both scans) to populate _DOCTOR_ISSUES — computed once
+  # here and serialized to a string, since _DOCTOR_ISSUES (a bash array)
   # would be just as subshell-fragile as a memo if read back after the fact.
-  local rows="" issues_tsv=""
+  # $ps_rows is handed to _doctor_warnings too (its own optional $2), so
+  # issues and processes are built from the exact SAME snapshot rather than
+  # two independent `ps` reads a live process could exit between — the same
+  # "cannot disagree by construction" guarantee cmd_doctor's own comment
+  # documents for _DOCTOR_ISSUES now also holds across this real/fixture scan.
+  local rows="" issues_tsv="" ps_rows=""
   case ",$only," in
-    *,chats,*|*,issues,*|*,processes,*) rows="$(_session_rows || true)" ;;
+    *,chats,*|*,issues,*) rows="$(_session_rows || true)" ;;
   esac
   case ",$only," in
-    *,issues,*|*,processes,*)
+    *,issues,*|*,processes,*) ps_rows="$(_ps_snapshot_rows || true)" ;;
+  esac
+  case ",$only," in
+    *,issues,*)
       _DOCTOR_ISSUES=()
-      _doctor_warnings "$rows" >/dev/null 2>&1 || true
+      _doctor_warnings "$rows" "$ps_rows" >/dev/null 2>&1 || true
       issues_tsv="$(printf '%s\n' "${_DOCTOR_ISSUES[@]+"${_DOCTOR_ISSUES[@]}"}")"
       ;;
   esac
@@ -125,7 +136,7 @@ _json_envelope() {
         frag+="$(printf '"%s":%s' "$sec" "$(_json_section_issues "$rows" "$issues_tsv")")" ;;
       processes)
         [[ -n "$frag" ]] && frag+=","
-        frag+="$(printf '"%s":%s' "$sec" "$(_json_section_processes "$issues_tsv")")" ;;
+        frag+="$(printf '"%s":%s' "$sec" "$(_json_section_processes "$ps_rows")")" ;;
       accounts|ledger|schedules)
         [[ -n "$frag" ]] && frag+=","
         frag+="$(printf '"%s":%s' "$sec" "$("_json_section_$sec")")" ;;
@@ -592,24 +603,25 @@ _json_section_chats() {
        degraded:$degraded, titlesIndex:$idx, items:$items}' <<<"$rows"
 }
 
-# ---- issues + processes sections -------------------------------------------
-# Both read the SAME _DOCTOR_ISSUES rows bin/claude-session's _doctor_warnings
+# ---- issues section ---------------------------------------------------------
+# Reads the SAME _DOCTOR_ISSUES rows bin/claude-session's _doctor_warnings
 # built — one implementation (the checks themselves, refactored to append a
 # structured row alongside their existing human-text printf), two renderings
-# (the human `doctor` text, unchanged, and these two JSON sections). $1/$2 are
-# passed in by _json_envelope, computed ONCE per invocation — _doctor_warnings
-# forks the OS process table scan for checks (6)-(7), so re-running it once
-# per section here would double that cost for nothing.
+# (the human `doctor` text, unchanged, and this JSON section). $1/$2 are
+# passed in by _json_envelope, computed ONCE per invocation.
 #
 # Pure bash, no `jq` here — this used to ALSO shape the filtered rows into
-# `{kind,severity,...}` objects via its own `jq -Rn`, and each section's own
+# `{kind,severity,...}` objects via its own `jq -Rn`, and the section's own
 # closing jq then took that array BACK in via `--argjson` just to wrap it in
 # `{status,checksRun,...}` — two forks to do what one can, since jq can just
 # as easily read these same tab-separated rows off stdin directly (exactly
 # how _json_section_chats' own single closing jq already works). Splitting
-# this into "filter" (bash) and "shape+wrap" (one jq, in each section below)
-# cut the issues+processes half of a `doctor --json`/`_snapshot` call from 5
-# jq forks to 2.
+# this into "filter" (bash) and "shape+wrap" (one jq, below) cut this
+# section's half of a `doctor --json`/`_snapshot` call from jq forks to one.
+#
+# The processes section below no longer shares this _DOCTOR_ISSUES-text
+# implementation (see its own header comment for why) — this bash filter and
+# its jq shaping now serve issues alone.
 _json_issues_rows_for() {
   local tsv="$1" want=" $2 " rows=""
   local kind sev pid sid text
@@ -667,24 +679,126 @@ _json_section_issues() {
     <<<"$filtered"
 }
 
-# $1 = the _DOCTOR_ISSUES rows. Checks (6)-(7) scan the OS process table
-# directly and always run, with or without any Claude session — so this
-# section is never "skipped", only ever ok with items:[] on a clean box.
+# ---- processes section ------------------------------------------------------
+# Unlike issues (above), this does NOT read _DOCTOR_ISSUES text — it drives
+# _orphan_rows/_stuck_build_rows/_orphan_activity directly off ONE
+# _ps_snapshot_rows table ($1, computed once by _json_envelope and shared
+# with _doctor_warnings — see that function's own header), so the Processes
+# place gets the SAME structured fields (pid, elapsedSec, class, a real
+# activity.subtree, …) that bin/claude-session's own doctor checks (6)-(7)
+# reason from, not a re-serialization of their human text. Checks (6)-(7)
+# scan the OS process table directly and always run, with or without any
+# Claude session — so this section is never "skipped" for lack of sessions,
+# only ever ok with items:[] on a clean box. An EMPTY/unreadable process
+# table is different: that is "nothing was checked", not "checked and
+# clean", so it is its own checksSkipped entry, never a silent clean pass.
+#
+# One row per _orphan_rows pid (class "orphan") and one row per
+# _stuck_build_rows pid (class "stuck-build") — the SAME two scans
+# _doctor_warnings' checks (6)-(7) run, so this section's item count can
+# never drift from the issues section's orphan-process/stuck-build count
+# (cmd_doctor's own JSON exit-status math sums both): a pid matching BOTH
+# scans (the exact shape of the 2026-08-03 finding — an orphaned build that
+# is also a stuck build) gets two items, one per class, exactly as
+# _doctor_warnings' two independent _di_add calls already would.
+#
+# reapable is true only for state=="idle" — "suspect" is NEVER auto-reaped
+# (see _orphan_activity's own header for why a no-progress sample is a
+# suspicion, not a confirmed hang), which is why it reads reapable:false
+# same as "active" despite being overridable with --force. reapBlockedBy
+# names WHICH guard is blocking a reap, for a UI that wants to render the
+# --force affordance only where it actually applies.
 _json_section_processes() {
-  local issues_tsv="${1:-}"
+  local ps_rows="${1:-}"
   _json_skip_reset
-  local filtered; filtered="$(_json_issues_rows_for "$issues_tsv" "orphan-process stuck-build")"
-  jq -Rn --argjson skipped "$(_json_skips_json)" \
+  local rows=""
+  if [[ -z "$ps_rows" ]]; then
+    _json_skip "orphans" "the process table was empty or unreadable"
+  else
+    # pid -> ppid, built ONCE in-shell (no fork) from the same table: orphan
+    # rows are ppid==1 by definition (_orphan_rows' own filter), but a stuck
+    # build can have any parent ("regardless of parentage" is that check's
+    # whole point), so its row alone doesn't carry ppid — this is the only
+    # other place that needs it.
+    local -A _jp_ppid=()
+    local jp_pid jp_ppid jp_rest
+    while IFS=$'\t' read -r jp_pid jp_ppid jp_rest; do
+      [[ -z "$jp_pid" ]] && continue
+      _jp_ppid[$jp_pid]="$jp_ppid"
+    done <<<"$ps_rows"
+
+    local orphan_rows stuck_rows
+    orphan_rows="$(_orphan_rows "$ps_rows" || true)"
+    stuck_rows="$(_stuck_build_rows "$ps_rows" || true)"
+
+    local pid etimes pcpu comm args act state reason subtree cmd reapable blockedby _row
+    if [[ -n "$orphan_rows" ]]; then
+      while IFS=$'\t' read -r pid etimes pcpu comm args; do
+        [[ -z "$pid" ]] && continue
+        act="$(_orphan_activity "$pid" "$ps_rows")"
+        IFS=$'\t' read -r state reason subtree <<<"$act"
+        cmd="$(_short_cmd "$args")"
+        case "$state" in
+          idle)    reapable="true";  blockedby="" ;;
+          active)  reapable="false"; blockedby="active-subtree" ;;
+          suspect) reapable="false"; blockedby="suspect-no-progress" ;;
+          *)       reapable="false"; blockedby="" ;;
+        esac
+        printf -v _row '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+          "$pid" "${_jp_ppid[$pid]:-1}" "$etimes" "$pcpu" "$comm" "$cmd" "$args" "orphan" \
+          "$state" "$reason" "$subtree" "$reapable" "$blockedby"
+        rows+="$_row"$'\n'
+      done <<<"$orphan_rows"
+    fi
+    if [[ -n "$stuck_rows" ]]; then
+      while IFS=$'\t' read -r pid etimes pcpu comm args; do
+        [[ -z "$pid" ]] && continue
+        act="$(_orphan_activity "$pid" "$ps_rows")"
+        IFS=$'\t' read -r state reason subtree <<<"$act"
+        cmd="$(_short_cmd "$args")"
+        case "$state" in
+          idle)    reapable="true";  blockedby="" ;;
+          active)  reapable="false"; blockedby="active-subtree" ;;
+          suspect) reapable="false"; blockedby="suspect-no-progress" ;;
+          *)       reapable="false"; blockedby="" ;;
+        esac
+        printf -v _row '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+          "$pid" "${_jp_ppid[$pid]:-}" "$etimes" "$pcpu" "$comm" "$cmd" "$args" "stuck-build" \
+          "$state" "$reason" "$subtree" "$reapable" "$blockedby"
+        rows+="$_row"$'\n'
+      done <<<"$stuck_rows"
+    fi
+  fi
+
+  # ONE jq for the whole section: the TSV rows in via stdin, the subtree's
+  # own \x1e/\x1f sub-delimiters in via --arg (never embedded as literal
+  # bytes in the jq program text, so this stays legible/greppable) — the
+  # same tri-level-delimiter shape _json_section_chats' own flags field
+  # already uses, applied here to a per-item array instead of a per-item enum.
+  jq -Rn --argjson skipped "$(_json_skips_json)" --arg RS $'\x1e' --arg US $'\x1f' \
     '[inputs | select(length>0) | split("\t") | {
-        kind: .[0], severity: .[1],
-        # pid is a NUMBER, matching the chats runtime.pid field — a typed
-        # consumer decodes "pid" the same way in every section. These are
-        # OS/session pids, always numeric; empty or "-" stays null.
-        pid: (if .[2]=="" or .[2]=="-" then null else (.[2]|tonumber) end),
-        sessionId: (if .[3]=="" or .[3]=="-" then null else .[3] end),
-        text: .[4]
+        pid: (.[0]|tonumber),
+        ppid: (if .[1]=="" or .[1]=="-" then null else (.[1]|tonumber) end),
+        elapsedSec: (.[2]|tonumber),
+        pcpu: (.[3]|tonumber),
+        comm: .[4],
+        cmd: .[5],
+        argsFull: .[6],
+        class: .[7],
+        activity: {
+          state: .[8],
+          reason: (if .[9]=="" then null else .[9] end),
+          subtree: (
+            if .[10]=="" then [] else
+              (.[10] | split($RS) | map(select(length>0) | split($US)
+                | {pid:(.[0]|tonumber), cmd:.[1], pcpu:(.[2]|tonumber)}))
+            end
+          )
+        },
+        reapable: (.[11]=="true"),
+        reapBlockedBy: (if .[12]=="" then null else .[12] end)
       }] as $items
-    | {status:"ok", checksRun:["orphan-process","stuck-build"], checksSkipped:$skipped,
+    | {status:"ok", checksRun:["orphans","stuck-builds"], checksSkipped:$skipped,
        errors:[], items:$items}' \
-    <<<"$filtered"
+    <<<"$rows"
 }

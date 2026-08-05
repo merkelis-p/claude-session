@@ -424,10 +424,17 @@ _orphan_rows() {
   done <<<"$rows"
 }
 
+# Shared with _orphan_activity's "suspect" classification (Step 4b): a
+# subtree member can only be called suspect using the SAME age threshold this
+# check names in its own "running >10m" text — never a second opinion on how
+# old is "too old", or the two checks could contradict each other again on a
+# process that is old enough for one but not the other.
+_ORPHAN_SUSPECT_AGE_S=600
+
 # One TSV row per process whose args match a *:build subcommand and has been
-# running > 600s — regardless of parentage. A plugin/package build takes
-# seconds; one running 10+ minutes is hung, whether or not its parent is
-# still alive. Same TSV shape as _orphan_rows.
+# running > _ORPHAN_SUSPECT_AGE_S — regardless of parentage. A plugin/package
+# build takes seconds; one running 10+ minutes is worth a second look, whether
+# or not its parent is still alive. Same TSV shape as _orphan_rows.
 #
 # Optional $1 = a pre-computed _ps_snapshot_rows result — see _orphan_rows'
 # own comment for why _doctor_warnings passes the same snapshot to both.
@@ -439,7 +446,7 @@ _stuck_build_rows() {
   while IFS=$'\t' read -r pid ppid etimes pcpu comm args; do
     [[ -z "$pid" ]] && continue
     [[ "$etimes" =~ ^[0-9]+$ ]] || continue
-    (( etimes > 600 )) || continue
+    (( etimes > _ORPHAN_SUSPECT_AGE_S )) || continue
     [[ "$args" == *:build* ]] || continue
     printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$etimes" "$pcpu" "$comm" "$args"
   done <<<"$rows"
@@ -494,9 +501,66 @@ _short_cmd() {
 _ORPHAN_ACTIVE_TOKEN_PATTERN='^(codex|claude|aider|pytest|ffmpeg|rsync|jest|vitest|tsc|webpack|cargo|gradle|mvn)$'
 _ORPHAN_ACTIVE_PHRASE_PATTERN='docker build|npm test|npm run build'
 
+# Sum of /proc/<pid>/io's syscr+syscw+wchar — a working build reads and
+# writes constantly; a spin loop makes almost no syscalls, so this sum barely
+# moves between two samples taken ~400ms apart. Prints nothing and fails
+# (rather than printing "0") when the file is missing/unreadable, so a caller
+# can tell "confirmed zero" apart from "could not read" — the same tri-state
+# discipline this file's _rss_get (lib/json.sh) already documents for RSS.
+_oa_io_counter() {
+  local f="/proc/${1:-}/io"
+  [[ -r "$f" ]] || return 1
+  awk '/^(syscr|syscw|wchar):/ { a += $2 } END { print a+0 }' "$f" 2>/dev/null
+}
+
+# $1 = pid. Prints exactly one of: progress | no-progress | skip.
+#
+# Linux-only: /proc does not exist on macOS, so on any non-Linux host this
+# is ALWAYS skip — the verdict must stay exactly what it is today, never
+# silently degrade into "no progress detected" just because the probe itself
+# isn't available there.
+#
+# A fictional $ORPHAN_PS_SRC fixture pid must never drive a REAL /proc read
+# either: its pid is an arbitrary test number that can coincidentally collide
+# with an unrelated real pid on whatever host runs the suite (the exact
+# hazard _do_reap's own dry-run guard documents for kill() — just as real
+# for a read, since a coincidental hit could flake a test's verdict). That
+# case is also skip, unless the test opts in below.
+#
+# skip (for any reason) leaves the caller's verdict at "active", never
+# "suspect" — the conservative asymmetry this file's _orphan_activity header
+# documents: a false active only delays a reap, but a *confirmed* no-progress
+# reading is what lets --force touch the process, so it must never be
+# answered with a guess.
+#
+# $ORPHAN_IO_SRC (pid<TAB>sample1<TAB>sample2, one line per pid) replaces the
+# probe end-to-end for tests: deterministic, and it removes the real ~400ms
+# sleep from the test path entirely.
+_oa_io_progress() {
+  local pid="$1"
+  if [[ -n "${ORPHAN_IO_SRC:-}" ]]; then
+    local line s1 s2
+    line="$(awk -F'\t' -v p="$pid" '$1==p{print; exit}' "$ORPHAN_IO_SRC" 2>/dev/null || true)"
+    [[ -z "$line" ]] && { printf 'skip'; return 0; }
+    IFS=$'\t' read -r _ s1 s2 <<<"$line"
+    [[ "$s1" =~ ^[0-9]+$ && "$s2" =~ ^[0-9]+$ ]] || { printf 'skip'; return 0; }
+    if (( s2 > s1 )); then printf 'progress'; else printf 'no-progress'; fi
+    return 0
+  fi
+  [[ -n "${ORPHAN_PS_SRC:-}" ]] && { printf 'skip'; return 0; }
+  [[ "$(_compat_os)" == "linux" ]] || { printf 'skip'; return 0; }
+  local s1 s2
+  s1="$(_oa_io_counter "$pid")" || { printf 'skip'; return 0; }
+  sleep 0.4
+  s2="$(_oa_io_counter "$pid")" || { printf 'skip'; return 0; }
+  if (( s2 > s1 )); then printf 'progress'; else printf 'no-progress'; fi
+}
+
 # Classify an orphan's full descendant subtree (the orphan pid itself, plus
-# every process reparented under it) as "active" or "idle". Prints
-# "active<TAB><reason>" on stdout, or "idle".
+# every process reparented under it) as "idle", "active", or "suspect".
+# Prints "<state><TAB><reason><TAB><subtree>" on stdout, where <subtree> is
+# every pid\x1fcmd\x1fpcpu record examined, joined by \x1e — a caller can
+# always show what was looked at, whatever the verdict.
 #
 # WHY this exists: `doctor` flags a pid as an orphan by looking only at ITS
 # OWN ppid/CPU — but the orphan is frequently just a shell wrapper sitting at
@@ -507,17 +571,38 @@ _ORPHAN_ACTIVE_PHRASE_PATTERN='docker build|npm test|npm run build'
 # instead.
 #
 # Reads the SAME process source as everything else (_ps_snapshot_rows), so it
-# honors $ORPHAN_PS_SRC in tests and never reads /proc directly itself.
+# honors $ORPHAN_PS_SRC in tests and never reads /proc directly itself for
+# the subtree walk (only _oa_io_progress ever touches /proc, and only for a
+# CPU-busy, already-old candidate — see that function's own header).
 #
-# Deliberately conservative, on purpose: a false "active" only costs a
-# skipped reap (the process spins a little longer — harmless); a false "idle"
-# destroys real work. When genuinely in doubt, this calls it active.
+# Deliberately conservative, on purpose: a false "active"/"suspect" only
+# costs a skipped reap (the process spins a little longer — harmless); a
+# false "idle" destroys real work. When genuinely in doubt, this calls it
+# active.
+#
+# 2026-08-03 finding (task-5-brief.md Step 4b): a spinning `*:build` process
+# read ~33% CPU with almost no real I/O over a 3s sample — CPU alone cannot
+# tell "spinning" apart from "building", so a subtree member this busy AND
+# old enough to already be flagged "hung" elsewhere (_stuck_build_rows'
+# _ORPHAN_SUSPECT_AGE_S) AND confirmed making no I/O progress is "suspect",
+# never silently "idle" and never silently upgraded to a stronger claim than
+# the evidence supports — the wording says "appears hung", not "is hung",
+# because a genuine CPU-bound phase (type-checking, say) can be quiet too.
+# Any OTHER subtree member that reads clearly active (busy-and-young,
+# busy-and-progressing, or matches the token/phrase patterns below) keeps the
+# WHOLE subtree "active" regardless of what else is also spinning next to
+# it — reaping it would still destroy that other member's real work.
 _orphan_activity() {
   local root="$1"
-  local rows; rows="$(_ps_snapshot_rows || true)"
-  [[ -z "$rows" ]] && { printf 'idle'; return 0; }
+  # $2 (optional): a pre-computed _ps_snapshot_rows table. The Processes place
+  # polls this, and re-snapshotting per orphan is what made `doctor` cost 2.4s
+  # — the same per-row-fork shape fixed twice already elsewhere in this file.
+  # The argument is optional so every existing caller keeps working unchanged.
+  local rows="${2:-}"
+  [[ -n "$rows" ]] || rows="$(_ps_snapshot_rows || true)"
+  [[ -z "$rows" ]] && { printf 'idle\t\t'; return 0; }
 
-  local -A _oa_children _oa_pcpu _oa_args _oa_comm
+  local -A _oa_children _oa_pcpu _oa_args _oa_comm _oa_etimes
   local pid ppid etimes pcpu comm args
   while IFS=$'\t' read -r pid ppid etimes pcpu comm args; do
     [[ -z "$pid" ]] && continue
@@ -525,6 +610,7 @@ _orphan_activity() {
     _oa_pcpu[$pid]="$pcpu"
     _oa_args[$pid]="$args"
     _oa_comm[$pid]="$comm"
+    _oa_etimes[$pid]="$etimes"
   done <<<"$rows"
 
   local -a queue=("$root") subtree=()
@@ -536,18 +622,42 @@ _orphan_activity() {
     for k in ${_oa_children[$cur]:-}; do queue+=("$k"); done
   done
 
-  local p
+  # Every return path below carries this SAME subtree — including idle — so
+  # a caller can always show exactly what was examined to reach the verdict.
+  local sub="" p
+  for p in "${subtree[@]}"; do
+    [[ -n "$sub" ]] && sub+=$'\x1e'
+    sub+="$p"$'\x1f'"$(_short_cmd "${_oa_args[$p]:-}")"$'\x1f'"${_oa_pcpu[$p]:-0}"
+  done
+
+  local active_reason="" suspect_reason=""
   for p in "${subtree[@]}"; do
     local pc="${_oa_pcpu[$p]:-0}"
-    if awk -v v="$pc" 'BEGIN{ if (v+0>=0.5) exit 0; exit 1 }' 2>/dev/null; then
-      printf 'active\t%s (%s%% CPU)' "$(_short_cmd "${_oa_args[$p]:-}")" "$pc"
-      return 0
+    awk -v v="$pc" 'BEGIN{ if (v+0>=0.5) exit 0; exit 1 }' 2>/dev/null || continue
+    local age="${_oa_etimes[$p]:-0}" is_suspect=0
+    if [[ "$age" =~ ^[0-9]+$ ]] && (( age > _ORPHAN_SUSPECT_AGE_S )); then
+      [[ "$(_oa_io_progress "$p")" == "no-progress" ]] && is_suspect=1
+    fi
+    if (( is_suspect )); then
+      [[ -z "$suspect_reason" ]] && suspect_reason="$(_short_cmd "${_oa_args[$p]:-}") (${pc}% CPU, $(_fmt_age_hm "$age"), no I/O progress) — appears hung, not confirmed"
+    else
+      active_reason="$(_short_cmd "${_oa_args[$p]:-}") (${pc}% CPU)"
+      break
     fi
   done
+  if [[ -n "$active_reason" ]]; then
+    printf 'active\t%s\t%s' "$active_reason" "$sub"
+    return 0
+  fi
+  if [[ -n "$suspect_reason" ]]; then
+    printf 'suspect\t%s\t%s' "$suspect_reason" "$sub"
+    return 0
+  fi
+
   for p in "${subtree[@]}"; do
     local ar="${_oa_args[$p]:-}" cm="${_oa_comm[$p]:-}"
     if [[ "$cm" =~ $_ORPHAN_ACTIVE_TOKEN_PATTERN ]] || [[ "$ar" =~ $_ORPHAN_ACTIVE_PHRASE_PATTERN ]]; then
-      printf 'active\t%s (long-running job)' "$(_short_cmd "$ar")"
+      printf 'active\t%s\t%s' "$(_short_cmd "$ar") (long-running job)" "$sub"
       return 0
     fi
     local -a _oa_toks; read -ra _oa_toks <<<"$ar"
@@ -555,12 +665,12 @@ _orphan_activity() {
     for t in ${_oa_toks[@]+"${_oa_toks[@]}"}; do
       tb="${t##*/}"
       if [[ "$tb" =~ $_ORPHAN_ACTIVE_TOKEN_PATTERN ]]; then
-        printf 'active\t%s (long-running job)' "$(_short_cmd "$ar")"
+        printf 'active\t%s\t%s' "$(_short_cmd "$ar") (long-running job)" "$sub"
         return 0
       fi
     done
   done
-  printf 'idle'
+  printf 'idle\t\t%s' "$sub"
 }
 
 # ---- doctor checks ---------------------------------------------------------
@@ -596,6 +706,16 @@ _doctor_warnings() {
   _DOCTOR_ISSUES=()
   local rows
   if (( $# >= 1 )); then rows="$1"; else rows="$(_session_rows || true)"; fi
+  # Optional $2 = a pre-computed _ps_snapshot_rows table, for callers
+  # (lib/json.sh's _json_envelope) that ALSO need the identical table for
+  # their own processes section — sharing it is what keeps the issues and
+  # processes item counts unable to disagree "by construction" (cmd_doctor's
+  # own comment on _DOCTOR_ISSUES): two renderings of one real snapshot,
+  # never two independent `ps` reads a live process could exit between.
+  # Falls back to scanning itself when called with no such argument (every
+  # other caller, e.g. the human `doctor` path), so this stays a safe
+  # standalone call.
+  local ps_rows="${2:-}"
 
   # Checks (1)-(5) inspect Claude session-state JSON files, so they need at
   # least one live/known session to say anything. Checks (6)-(7) scan the OS
@@ -733,8 +853,11 @@ _doctor_warnings() {
   # ONE process-table snapshot for both check (6) and check (7) below — they
   # read the identical table, and this call used to happen twice (once
   # inside each of _orphan_rows/_stuck_build_rows), doubling `ps`'s cost on
-  # every `ls`/`doctor` for no reason.
-  local ps_rows; ps_rows="$(_ps_snapshot_rows || true)"
+  # every `ls`/`doctor` for no reason. Uses the pre-computed $ps_rows (this
+  # function's own optional $2) when a caller already has one, so lib/json.sh
+  # never pays for a second real snapshot to build its processes section from
+  # the same data this function's own _di_add calls just described.
+  [[ -n "$ps_rows" ]] || ps_rows="$(_ps_snapshot_rows || true)"
   local orphan_rows; orphan_rows="$(_orphan_rows "$ps_rows" || true)"
   if [[ -n "$orphan_rows" ]]; then
     local orphan_count total_cpu
@@ -743,22 +866,30 @@ _doctor_warnings() {
 
     local reapable_count=0 busy_count=0
     local -A _oa_status _oa_reason
-    local pid etimes pcpu comm args act
+    local pid etimes pcpu comm args act state reason subtree
     while IFS=$'\t' read -r pid etimes pcpu comm args; do
       [[ -z "$pid" ]] && continue
-      act="$(_orphan_activity "$pid")"
-      if [[ "$act" == active$'\t'* ]]; then
-        _oa_status[$pid]="active"
-        _oa_reason[$pid]="${act#active$'\t'}"
-        busy_count=$((busy_count+1))
-        _di_add "orphan-process" "info" "$pid" "" \
-          "orphaned dev process $pid ($(_short_cmd "$args")), $(_fmt_age_hm "$etimes") — active (${_oa_reason[$pid]}), reap will skip it"
-      else
-        _oa_status[$pid]="idle"
-        reapable_count=$((reapable_count+1))
-        _di_add "orphan-process" "warning" "$pid" "" \
-          "orphaned dev process $pid ($(_short_cmd "$args")), $(_fmt_age_hm "$etimes") — reapable"
-      fi
+      act="$(_orphan_activity "$pid" "$ps_rows")"
+      IFS=$'\t' read -r state reason subtree <<<"$act"
+      _oa_status[$pid]="$state"
+      _oa_reason[$pid]="$reason"
+      case "$state" in
+        active)
+          busy_count=$((busy_count+1))
+          _di_add "orphan-process" "info" "$pid" "" \
+            "orphaned dev process $pid ($(_short_cmd "$args")), $(_fmt_age_hm "$etimes") — active (${reason}), reap will skip it"
+          ;;
+        suspect)
+          busy_count=$((busy_count+1))
+          _di_add "orphan-process" "warning" "$pid" "" \
+            "orphaned dev process $pid ($(_short_cmd "$args")), $(_fmt_age_hm "$etimes") — ${reason}; reap will skip it, doctor --reap --force overrides"
+          ;;
+        *)
+          reapable_count=$((reapable_count+1))
+          _di_add "orphan-process" "warning" "$pid" "" \
+            "orphaned dev process $pid ($(_short_cmd "$args")), $(_fmt_age_hm "$etimes") — reapable"
+          ;;
+      esac
     done <<<"$orphan_rows"
 
     printf '%b %d orphaned dev process(es) (ppid=1), %s%% CPU total — %d reapable, %d busy (parents died)\n' \
@@ -771,9 +902,10 @@ _doctor_warnings() {
       [[ "${_oa_status[$pid]:-idle}" == "idle" ]] && marker="  [reapable]"
       printf '    pid %s  %s  %s%%  %s%s\n' \
         "$pid" "$(_fmt_age_hm "$etimes")" "$pcpu" "$(truncate_str "$(_short_cmd "$args")" 50)" "$marker"
-      if [[ "${_oa_status[$pid]:-idle}" == "active" ]]; then
-        printf '        ↳ active: %s — reap will skip it\n' "${_oa_reason[$pid]}"
-      fi
+      case "${_oa_status[$pid]:-idle}" in
+        active)  printf '        ↳ active: %s — reap will skip it\n' "${_oa_reason[$pid]}" ;;
+        suspect) printf '        ↳ suspect: %s — reap skips it by default, --reap --force overrides\n' "${_oa_reason[$pid]}" ;;
+      esac
     done <<<"$orphan_rows"
     if (( orphan_count > 5 )); then
       printf '    … and %d more\n' "$(( orphan_count - 5 ))"
@@ -782,19 +914,35 @@ _doctor_warnings() {
   fi
 
   # (7) Stuck builds (*:build), regardless of parentage — a plugin/package
-  # build takes seconds; one running 10+ minutes is hung.
+  # build takes seconds; one running past _ORPHAN_SUSPECT_AGE_S is worth a
+  # second look. Each pid is ALSO run through _orphan_activity (rooted at
+  # itself, over the SAME $ps_rows check (6) shares) so this check's own
+  # per-process text can never again contradict check (6)'s for the same
+  # pid — the exact defect task-5-brief.md Step 4b measured on 2026-08-03,
+  # where this line unconditionally said "hung" for a pid check (6) had
+  # already called "active" from the same CPU sample. The one-line summary
+  # below still names why the check exists (a build running this long is
+  # always worth a look); the per-process resolution says whether it is
+  # actually still working, only suspected of being stuck, or genuinely idle.
   local stuck_rows; stuck_rows="$(_stuck_build_rows "$ps_rows" || true)"
   if [[ -n "$stuck_rows" ]]; then
     local stuck_count oldest
     stuck_count="$(wc -l <<<"$stuck_rows")"
     oldest="$(awk -F'\t' 'BEGIN{m=0} {if($2+0>m) m=$2+0} END{print m}' <<<"$stuck_rows")"
-    printf '%b %d stuck build process(es) — *:build running >10m (oldest %s) — a build this long is hung\n' \
+    printf '%b %d stuck build process(es) — *:build running >10m (oldest %s) — running this long CAN mean hung, but CPU alone cannot tell spinning from building; see doctor --reap for the per-process call\n' \
       "$GLYPH_ALERT" "$stuck_count" "$(_fmt_age_hm "$oldest")"
-    local sb_pid sb_etimes sb_pcpu sb_comm sb_args
+    local sb_pid sb_etimes sb_pcpu sb_comm sb_args sb_act sb_state sb_reason sb_sub sb_note
     while IFS=$'\t' read -r sb_pid sb_etimes sb_pcpu sb_comm sb_args; do
       [[ -z "$sb_pid" ]] && continue
+      sb_act="$(_orphan_activity "$sb_pid" "$ps_rows")"
+      IFS=$'\t' read -r sb_state sb_reason sb_sub <<<"$sb_act"
+      case "$sb_state" in
+        active)  sb_note="still active (${sb_reason}) — a build this long is not hung here, reap would skip it" ;;
+        suspect) sb_note="${sb_reason} — reap skips it by default, doctor --reap --force overrides" ;;
+        *)       sb_note="no CPU/IO activity — a build this long is hung" ;;
+      esac
       _di_add "stuck-build" "warning" "$sb_pid" "" \
-        "stuck build $sb_pid ($(_short_cmd "$sb_args")), running $(_fmt_age_hm "$sb_etimes") — a build this long is hung"
+        "stuck build $sb_pid ($(_short_cmd "$sb_args")), running $(_fmt_age_hm "$sb_etimes") — $sb_note"
     done <<<"$stuck_rows"
   fi
 
@@ -1362,47 +1510,80 @@ _reap_one() {
 # prompting — an orphan with real work still running in its subtree (an agent
 # job, a build, a test suite several levels down) must never be killed just
 # because the root pid itself is idle. See _orphan_activity for the full why.
+#
+# Three buckets, not two, since _orphan_activity now returns idle/active/
+# suspect: idle is always reaped, active is NEVER reaped (--force does not
+# touch it — a genuinely progressing subtree is never overridable), and
+# suspect is reaped ONLY when --force is given. This is the actual fix for
+# the safety defect task-5-brief.md Step 4b measured on 2026-08-03: a
+# spinning `*:build` process read "active" by raw CPU (so it was never in
+# idle_pids) and "hung" by the stuck-build check, and --force did not help
+# because it was never consulted before this split — a process spinning at a
+# third of a core could not be removed by this tool at all. Now a build that
+# is genuinely busy stays un-killable no matter what; a build that LOOKS busy
+# but has made no I/O progress past the stuck threshold can be force-reaped,
+# which is the path this tool lacked (the only prior way out was a bare
+# `pkill -f`, which has no guard at all).
 _do_reap() {
-  local orphan_rows; orphan_rows="$(_orphan_rows || true)"
+  local orphan_ps_rows; orphan_ps_rows="$(_ps_snapshot_rows || true)"
+  local orphan_rows; orphan_rows="$(_orphan_rows "$orphan_ps_rows" || true)"
   if [[ -z "$orphan_rows" ]]; then
     printf '%bnothing to reap%b\n' "$DIM" "$N"
     return 0
   fi
 
-  local -a idle_pids=() active_pids=()
-  local -A act_reason
-  local pid etimes pcpu comm args act
+  local -a idle_pids=() active_pids=() suspect_pids=()
+  local -A act_reason act_state
+  local pid etimes pcpu comm args act state reason subtree
   while IFS=$'\t' read -r pid etimes pcpu comm args; do
     [[ -z "$pid" ]] && continue
-    act="$(_orphan_activity "$pid")"
-    if [[ "$act" == active$'\t'* ]]; then
-      active_pids+=("$pid")
-      act_reason[$pid]="${act#active$'\t'}"
-    else
-      idle_pids+=("$pid")
-    fi
+    act="$(_orphan_activity "$pid" "$orphan_ps_rows")"
+    IFS=$'\t' read -r state reason subtree <<<"$act"
+    act_state[$pid]="$state"
+    act_reason[$pid]="$reason"
+    case "$state" in
+      active)  active_pids+=("$pid") ;;
+      suspect) suspect_pids+=("$pid") ;;
+      *)       idle_pids+=("$pid") ;;
+    esac
   done <<<"$orphan_rows"
 
   printf '\n%borphans found:%b\n' "$BOLD" "$N"
   while IFS=$'\t' read -r pid etimes pcpu comm args; do
-    if [[ -n "${act_reason[$pid]+x}" ]]; then
-      printf '  pid %-8s %-8s %5s%%  %-50s  %b(active — will be skipped)%b\n' \
-        "$pid" "$(_fmt_age_hm "$etimes")" "$pcpu" "$(truncate_str "$(_short_cmd "$args")" 50)" "$Y" "$N"
-    else
-      printf '  pid %-8s %-8s %5s%%  %s\n' \
-        "$pid" "$(_fmt_age_hm "$etimes")" "$pcpu" "$(truncate_str "$(_short_cmd "$args")" 50)"
-    fi
+    [[ -z "$pid" ]] && continue
+    case "${act_state[$pid]:-idle}" in
+      active)
+        printf '  pid %-8s %-8s %5s%%  %-50s  %b(active — will be skipped)%b\n' \
+          "$pid" "$(_fmt_age_hm "$etimes")" "$pcpu" "$(truncate_str "$(_short_cmd "$args")" 50)" "$Y" "$N"
+        ;;
+      suspect)
+        printf '  pid %-8s %-8s %5s%%  %-50s  %b(suspected hung — needs --force)%b\n' \
+          "$pid" "$(_fmt_age_hm "$etimes")" "$pcpu" "$(truncate_str "$(_short_cmd "$args")" 50)" "$R" "$N"
+        ;;
+      *)
+        printf '  pid %-8s %-8s %5s%%  %s\n' \
+          "$pid" "$(_fmt_age_hm "$etimes")" "$pcpu" "$(truncate_str "$(_short_cmd "$args")" 50)"
+        ;;
+    esac
   done <<<"$orphan_rows"
 
-  if (( ${#idle_pids[@]} == 0 )); then
-    printf '\n%bnothing reaped — every orphan has active work in its subtree (see above); rerun once it finishes%b\n' \
-      "$Y" "$N"
+  local -a reap_pids=("${idle_pids[@]+"${idle_pids[@]}"}")
+  (( FORCE == 1 )) && reap_pids+=("${suspect_pids[@]+"${suspect_pids[@]}"}")
+
+  if (( ${#reap_pids[@]} == 0 )); then
+    if (( ${#suspect_pids[@]} > 0 )); then
+      printf '\n%bnothing reaped — %d suspected-hung process(es) need --force to override (see above); everything else has active work in its subtree%b\n' \
+        "$Y" "${#suspect_pids[@]}" "$N"
+    else
+      printf '\n%bnothing reaped — every orphan has active work in its subtree (see above); rerun once it finishes%b\n' \
+        "$Y" "$N"
+    fi
     return 0
   fi
 
   if (( FORCE == 0 )); then
     if _cs_interactive; then
-      printf '\n%breap %d orphaned process(es)? [y/N]%b ' "$R" "${#idle_pids[@]}" "$N"
+      printf '\n%breap %d orphaned process(es)? [y/N]%b ' "$R" "${#reap_pids[@]}" "$N"
       local confirm; read -r confirm || confirm=""
       if [[ "$confirm" != [yY] ]]; then
         printf '%bcancelled%b\n' "$DIM" "$N"
@@ -1424,15 +1605,25 @@ _do_reap() {
   # only branch allowed to run non-interactively against a fake process table.
   if [[ -n "${ORPHAN_PS_SRC:-}" ]]; then
     printf '\n%b[dry-run] fixture process table ($ORPHAN_PS_SRC set) — no kill will be issued%b\n' "$Y" "$N"
-    local p
-    for p in "${idle_pids[@]}"; do
-      printf '  [dry-run] would reap pid %s\n' "$p"
+    local p dryrun_skipped=${#active_pids[@]}
+    for p in "${reap_pids[@]}"; do
+      if [[ "${act_state[$p]:-idle}" == "suspect" ]]; then
+        printf '  [dry-run] would reap pid %s — forced past a suspected-hung guard: %s\n' "$p" "${act_reason[$p]}"
+      else
+        printf '  [dry-run] would reap pid %s\n' "$p"
+      fi
     done
     for p in "${active_pids[@]+"${active_pids[@]}"}"; do
       printf '  [dry-run] would skip pid %s — active work in its subtree: %s\n' "$p" "${act_reason[$p]}"
     done
+    if (( FORCE == 0 )); then
+      for p in "${suspect_pids[@]+"${suspect_pids[@]}"}"; do
+        printf '  [dry-run] would skip pid %s — %s (rerun with --force to override)\n' "$p" "${act_reason[$p]}"
+        dryrun_skipped=$((dryrun_skipped+1))
+      done
+    fi
     printf '\n%b[dry-run] reaped 0, skipped %d (busy), skipped 0 (failed re-verification)%b\n' \
-      "$BOLD" "${#active_pids[@]}" "$N"
+      "$BOLD" "$dryrun_skipped" "$N"
     return 0
   fi
 
@@ -1442,7 +1633,13 @@ _do_reap() {
     printf '  %bskip pid %s — active work in its subtree: %s%b\n' "$Y" "$p" "${act_reason[$p]}" "$N"
     busy_skipped=$((busy_skipped+1))
   done
-  for p in "${idle_pids[@]}"; do
+  if (( FORCE == 0 )); then
+    for p in "${suspect_pids[@]+"${suspect_pids[@]}"}"; do
+      printf '  %bskip pid %s — %s (rerun with --force to override)%b\n' "$Y" "$p" "${act_reason[$p]}" "$N"
+      busy_skipped=$((busy_skipped+1))
+    done
+  fi
+  for p in "${reap_pids[@]}"; do
     if _reap_one "$p"; then reaped=$((reaped+1)); else failed_skipped=$((failed_skipped+1)); fi
   done
   printf '\n%breaped %d, skipped %d (busy), skipped %d (failed re-verification)%b\n' \

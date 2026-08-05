@@ -94,10 +94,28 @@ claude-session doctor --reap --force    # unattended (e.g. from a cron job or CI
 `--reap` re-verifies each candidate immediately before killing it (a parent
 could have reappeared, or the pid could already be gone), sends `SIGTERM`
 to the whole subtree, waits, then `SIGKILL`s anything still alive. It never
-touches pid 1 or itself. Every "active" orphan found above is skipped and
-reported, never killed, regardless of `--force` — `--force` only removes
-the interactive confirmation for the orphans already classified as idle; it
-does not override the activity classification.
+touches pid 1 or itself.
+
+An orphan's subtree is classified `idle`, `active`, or `suspect`:
+
+- **`active`** — a descendant is doing real work (busy CPU, or a known
+  long-running command). Skipped and reported, never killed, **regardless of
+  `--force`**: a genuinely working build or agent run must not be destroyed by
+  an unattended reap. `--force` cannot override this.
+- **`suspect`** — a `*:build` (or other CPU-busy) process that is past the
+  "this has run too long" threshold **and** has made no measurable I/O progress
+  across a short sample (Linux only, via `/proc/<pid>/io`; on other platforms
+  the probe is skipped and the process stays `active`). It *appears* hung but is
+  not proven so — a CPU-bound phase such as type-checking can be legitimately
+  quiet — so it is **never auto-reaped**. This is the one case `--force`
+  overrides: with `--force` a `suspect` subtree is killed, giving you a guarded
+  path to clear a spinning build that would otherwise be immortal to the reaper.
+- **`idle`** — nothing is running under it. Reaped after the interactive confirm,
+  or immediately under `--force`.
+
+So `--force` removes the interactive confirmation for `idle` orphans and,
+additionally, overrides the guard for `suspect` ones — but it never touches a
+genuinely `active` subtree.
 
 Without a TTY and without `--force`, `--reap` refuses outright (exit status
 2) rather than silently doing nothing or silently proceeding — there is no

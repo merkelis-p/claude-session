@@ -133,8 +133,24 @@ _json_envelope() {
          return 2 ;;
     esac
   done
+  # Inlined _epoch_ms body, not `"$(_epoch_ms)"`: capturing ANY command's
+  # output via `$(...)` forks a subshell regardless of whether the command
+  # itself forks — same cost as the `date +%s` this replaced. Doing the
+  # EPOCHREALTIME substring extraction directly in THIS shell (exactly
+  # _epoch_ms's own body, inlined) is what actually avoids the fork; calling
+  # the function instead of inlining it would not have. One `date +%s` fork
+  # remains only on bash<5 (no EPOCHREALTIME), same fallback _epoch_ms uses.
+  local _now_ms
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then
+    local _r="${EPOCHREALTIME/,/.}"
+    local _s="${_r%%.*}"
+    local _f="${_r#*.}"
+    _now_ms="${_s}${_f:0:3}"
+  else
+    _now_ms="$(date +%s)000"
+  fi
   printf '{"schemaVersion":%s,"generatedAt":%s,"elapsedMs":%s,"core":%s,"sections":{%s}}' \
-    "$JSON_SCHEMA_VERSION" "$(date +%s)" "$(( $(_epoch_ms) - JSON_T0 ))" "$(_json_core)" "$frag" \
+    "$JSON_SCHEMA_VERSION" "${_now_ms%???}" "$(( _now_ms - JSON_T0 ))" "$(_json_core)" "$frag" \
     | jq -c . \
     || { echo "claude-session: internal error — an emitter produced invalid JSON" >&2; return 1; }
 }
@@ -540,7 +556,17 @@ _json_section_chats() {
 # passed in by _json_envelope, computed ONCE per invocation — _doctor_warnings
 # forks the OS process table scan for checks (6)-(7), so re-running it once
 # per section here would double that cost for nothing.
-_json_issues_items_for() {
+#
+# Pure bash, no `jq` here — this used to ALSO shape the filtered rows into
+# `{kind,severity,...}` objects via its own `jq -Rn`, and each section's own
+# closing jq then took that array BACK in via `--argjson` just to wrap it in
+# `{status,checksRun,...}` — two forks to do what one can, since jq can just
+# as easily read these same tab-separated rows off stdin directly (exactly
+# how _json_section_chats' own single closing jq already works). Splitting
+# this into "filter" (bash) and "shape+wrap" (one jq, in each section below)
+# cut the issues+processes half of a `doctor --json`/`_snapshot` call from 5
+# jq forks to 2.
+_json_issues_rows_for() {
   local tsv="$1" want=" $2 " rows=""
   local kind sev pid sid text
   while IFS=$'\t' read -r kind sev pid sid text; do
@@ -551,34 +577,47 @@ _json_issues_items_for() {
     # here that a fork would be worth paying for.
     rows+="$kind"$'\t'"$sev"$'\t'"$pid"$'\t'"$sid"$'\t'"$text"$'\n'
   done <<<"$tsv"
-  jq -Rn '[inputs | select(length>0) | split("\t") | {
-      kind: .[0], severity: .[1],
-      pid: (if .[2]=="" or .[2]=="-" then null else .[2] end),
-      sessionId: (if .[3]=="" or .[3]=="-" then null else .[3] end),
-      text: .[4]
-    }]' <<<"$rows"
+  printf '%s' "$rows"
 }
 
 # $1 = _session_rows output for this invocation (to tell "ran, found nothing"
 # apart from "nothing to check" — see below); $2 = the _DOCTOR_ISSUES rows.
+#
+# Covers checks (1)-(5) AND (8)-(9): every _DOCTOR_ISSUES kind that isn't one
+# of processes' two (orphan-process, stuck-build — checks 6-7, OS-process-table
+# scans that always run). Title-index health (8) and upstream schema drift (9)
+# used to feed neither JSON section at all — bin/claude-session's own
+# _doctor_warnings comment called that out as an undercount risk, since a
+# monitor trusting doctor's exit status would never learn its title index
+# degraded. They run unconditionally (not gated on $rows having any session to
+# look at), so their items/checksRun entries are never part of the
+# no-sessions skip below — only checks (1)-(5) are.
 _json_section_issues() {
   local rows="${1:-}" issues_tsv="${2:-}"
   _json_skip_reset
-  local checknames="same-chat-twice rc-bridge-shared duplicate-bridge stalled stale"
-  local items checksRunJson
+  local session_checknames="same-chat-twice rc-bridge-shared duplicate-bridge stalled stale"
+  local always_checknames="title-index upstream-field"
+  local checknames="$session_checknames $always_checknames"
   if [[ -z "$rows" ]]; then
     # Checks (1)-(5) inspect Claude session-state files (_doctor_warnings'
     # own guard: `if [[ -n "$rows" ]]`) — with none to check, every one of
     # them is a check that did not run, not a check that ran and passed.
     local c
-    for c in $checknames; do _json_skip "$c" "no Claude session-state files to check"; done
-    items="[]"; checksRunJson="[]"
-  else
-    items="$(_json_issues_items_for "$issues_tsv" "$checknames")"
-    checksRunJson="$(jq -n --arg s "$checknames" '$s|split(" ")')"
+    for c in $session_checknames; do _json_skip "$c" "no Claude session-state files to check"; done
   fi
-  jq -n --argjson items "$items" --argjson skipped "$(_json_skips_json)" --argjson cr "$checksRunJson" \
-    '{status:"ok", checksRun:$cr, checksSkipped:$skipped, errors:[], items:$items}'
+  # ONE jq for the whole section: filtered TSV rows in via stdin, checknames
+  # in via --arg (split inside jq — no separate fork just to turn a
+  # space-joined string into a JSON array), skip list in via --argjson.
+  local filtered; filtered="$(_json_issues_rows_for "$issues_tsv" "$checknames")"
+  jq -Rn --argjson skipped "$(_json_skips_json)" --arg cr "$checknames" \
+    '[inputs | select(length>0) | split("\t") | {
+        kind: .[0], severity: .[1],
+        pid: (if .[2]=="" or .[2]=="-" then null else .[2] end),
+        sessionId: (if .[3]=="" or .[3]=="-" then null else .[3] end),
+        text: .[4]
+      }] as $items
+    | {status:"ok", checksRun:($cr|split(" ")), checksSkipped:$skipped, errors:[], items:$items}' \
+    <<<"$filtered"
 }
 
 # $1 = the _DOCTOR_ISSUES rows. Checks (6)-(7) scan the OS process table
@@ -587,8 +626,15 @@ _json_section_issues() {
 _json_section_processes() {
   local issues_tsv="${1:-}"
   _json_skip_reset
-  local items; items="$(_json_issues_items_for "$issues_tsv" "orphan-process stuck-build")"
-  jq -n --argjson items "$items" --argjson skipped "$(_json_skips_json)" \
-    '{status:"ok", checksRun:["orphan-process","stuck-build"], checksSkipped:$skipped,
-      errors:[], items:$items}'
+  local filtered; filtered="$(_json_issues_rows_for "$issues_tsv" "orphan-process stuck-build")"
+  jq -Rn --argjson skipped "$(_json_skips_json)" \
+    '[inputs | select(length>0) | split("\t") | {
+        kind: .[0], severity: .[1],
+        pid: (if .[2]=="" or .[2]=="-" then null else .[2] end),
+        sessionId: (if .[3]=="" or .[3]=="-" then null else .[3] end),
+        text: .[4]
+      }] as $items
+    | {status:"ok", checksRun:["orphan-process","stuck-build"], checksSkipped:$skipped,
+       errors:[], items:$items}' \
+    <<<"$filtered"
 }

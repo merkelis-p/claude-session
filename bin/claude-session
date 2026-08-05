@@ -596,7 +596,6 @@ _doctor_warnings() {
   _DOCTOR_ISSUES=()
   local rows
   if (( $# >= 1 )); then rows="$1"; else rows="$(_session_rows || true)"; fi
-  local n=0
 
   # Checks (1)-(5) inspect Claude session-state JSON files, so they need at
   # least one live/known session to say anything. Checks (6)-(7) scan the OS
@@ -606,81 +605,116 @@ _doctor_warnings() {
   # (and possibly hung builds) remain.
   if [[ -n "$rows" ]]; then
 
+  # ONE bash-native pass over $rows building every grouping checks (1)-(5)
+  # need, instead of 6 separate `awk` forks (one per check's own grouping/
+  # projection, plus a second pipeline stage for check 3) — bash's own `read`
+  # already splits the tab-delimited columns _session_rows emits, and
+  # `map[key]+=...`-style accumulation needs no subprocess at all. Same
+  # "hoist one scan, pass it down" principle already applied to
+  # _ps_snapshot_rows/_ram_load/_ot_load elsewhere in this codebase: checks
+  # (1)-(5) were the one place left still paying an unconditional per-check
+  # fork for a scan the other checks already share. Measured: these 6 awk
+  # forks alone cost ~90-120ms of the ~400ms poll budget in this sandbox
+  # (see tests/test_scan_fork_budget.sh's own fork-cost note) — pure
+  # overhead, since none of it varies with row count in the fixtures that
+  # exercise it.
+  local -A _dw_sid_pids=() _dw_sid_n=() _dw_bid_pids=() _dw_bid_n=() \
+           _dw_ca_pids=() _dw_ca_n=() _dw_ca_bridged=()
+  local -a _dw_waiting=() _dw_stale=()
+  local dw_sess dw_pid dw_cwd dw_entry dw_status dw_sid dw_bid dw_upd dw_alive dw_acct dw_key dw_mark
+  while IFS=$'\t' read -r dw_sess dw_pid dw_cwd dw_entry dw_status dw_sid dw_bid dw_upd dw_alive dw_acct; do
+    [[ -z "$dw_pid" ]] && continue
+    dw_mark=""
+    [[ "$dw_bid" != "-" && -n "$dw_bid" ]] && dw_mark="|OK"
+    if [[ "$dw_sid" != "-" && -n "$dw_sid" ]]; then
+      _dw_sid_pids[$dw_sid]="${_dw_sid_pids[$dw_sid]:+${_dw_sid_pids[$dw_sid]}:}$dw_pid"
+      _dw_sid_n[$dw_sid]=$(( ${_dw_sid_n[$dw_sid]:-0} + 1 ))
+    fi
+    if [[ "$dw_bid" != "-" && -n "$dw_bid" ]]; then
+      _dw_bid_pids[$dw_bid]="${_dw_bid_pids[$dw_bid]:+${_dw_bid_pids[$dw_bid]}:}$dw_pid"
+      _dw_bid_n[$dw_bid]=$(( ${_dw_bid_n[$dw_bid]:-0} + 1 ))
+    fi
+    dw_key="$dw_cwd#$dw_acct"
+    _dw_ca_pids[$dw_key]="${_dw_ca_pids[$dw_key]:+${_dw_ca_pids[$dw_key]}:}${dw_pid}${dw_mark}"
+    _dw_ca_n[$dw_key]=$(( ${_dw_ca_n[$dw_key]:-0} + 1 ))
+    [[ -n "$dw_mark" ]] && _dw_ca_bridged[$dw_key]=$(( ${_dw_ca_bridged[$dw_key]:-0} + 1 ))
+    if [[ "$dw_alive" == "1" && "$dw_status" == waiting* ]]; then
+      _dw_waiting+=("$dw_pid"$'\t'"$dw_cwd"$'\t'"$dw_status"$'\t'"$dw_upd")
+    fi
+    [[ "$dw_alive" == "0" ]] && _dw_stale+=("$dw_pid"$'\t'"$dw_cwd"$'\t'"$dw_acct")
+  done <<<"$rows"
+
   # (1) Two PIDs with the SAME sessionId  — true "exact same chat opened twice".
-  while IFS=$'\t' read -r sid pids; do
-    [[ -z "$sid" || "$sid" == "-" ]] && continue
-    local count; count="$(awk -F: '{print NF}' <<<"$pids")"
+  local sid
+  for sid in "${!_dw_sid_pids[@]}"; do
+    local count="${_dw_sid_n[$sid]}" pids="${_dw_sid_pids[$sid]}"
     if (( count > 1 )); then
       printf '%b same chat %s open in %d procs: %s\n' \
         "$GLYPH_ALERT" "$(truncate_str "$sid" 18)" "$count" "$(truncate_str "$pids" 40)"
-      n=$((n+1))
       _di_add "same-chat-twice" "warning" "" "$sid" \
         "same chat open in $count procs: $pids"
     fi
-  done < <(awk -F '\t' '$6!="-" && $6!="" { a[$6] = (a[$6] ? a[$6]":" : "") $2 } END { for (k in a) print k"\t"a[k] }' <<<"$rows")
+  done
 
   # (2) Two PIDs with the SAME bridgeSessionId — Remote Control bridge held by two procs.
-  while IFS=$'\t' read -r bid pids; do
-    [[ -z "$bid" || "$bid" == "-" ]] && continue
-    local count; count="$(awk -F: '{print NF}' <<<"$pids")"
+  local bid
+  for bid in "${!_dw_bid_pids[@]}"; do
+    local count="${_dw_bid_n[$bid]}" pids="${_dw_bid_pids[$bid]}"
     if (( count > 1 )); then
       printf '%b RC bridge %s held by %d procs: %s\n' \
         "$GLYPH_ALERT" "$(truncate_str "$bid" 18)" "$count" "$(truncate_str "$pids" 40)"
-      n=$((n+1))
       _di_add "rc-bridge-shared" "warning" "" "" \
         "RC bridge $bid held by $count procs: $pids"
     fi
-  done < <(awk -F '\t' '$7!="-" && $7!="" { a[$7] = (a[$7] ? a[$7]":" : "") $2 } END { for (k in a) print k"\t"a[k] }' <<<"$rows")
+  done
 
   # (3) Multiple PIDs for same (cwd, account) but only some bridged — duplicate-RC
   # pattern. Different accounts sharing a cwd are excluded on purpose (see the
   # per-(cwd,account) dup-guard in the launch path).
-  while IFS=$'\t' read -r key group; do
+  local key
+  for key in "${!_dw_ca_pids[@]}"; do
     local dup_cwd="${key%%#*}" dup_acct="${key#*#}"
-    local total bridged
-    total="$(awk -F: '{print NF}' <<<"$group")"
-    bridged="$(awk -F: '{n=0; for(i=1;i<=NF;i++) if($i ~ /\|OK/) n++; print n}' <<<"$group")"
-    if (( total > 1 )); then
-      if (( bridged >= 1 && bridged < total )); then
-        local acct_tag=""
-        [[ "$dup_acct" != "default" ]] && acct_tag=" [$dup_acct]"
-        printf '%b %s%s: %d procs, %d bridged — others mirror text, no approvals\n' \
-          "$GLYPH_ALERT" "$(short_home "$dup_cwd")" "$acct_tag" "$total" "$bridged"
-        printf '    PIDs: %s\n' "$(truncate_str "$group" 60)"
-        n=$((n+1))
-        _di_add "duplicate-bridge" "warning" "" "" \
-          "$dup_cwd$acct_tag: $total procs, $bridged bridged — others mirror text, no approvals ($group)"
-      fi
+    local total="${_dw_ca_n[$key]}" bridged="${_dw_ca_bridged[$key]:-0}" group="${_dw_ca_pids[$key]}"
+    if (( total > 1 && bridged >= 1 && bridged < total )); then
+      local acct_tag=""
+      [[ "$dup_acct" != "default" ]] && acct_tag=" [$dup_acct]"
+      printf '%b %s%s: %d procs, %d bridged — others mirror text, no approvals\n' \
+        "$GLYPH_ALERT" "$(short_home "$dup_cwd")" "$acct_tag" "$total" "$bridged"
+      printf '    PIDs: %s\n' "$(truncate_str "$group" 60)"
+      _di_add "duplicate-bridge" "warning" "" "" \
+        "$dup_cwd$acct_tag: $total procs, $bridged bridged — others mirror text, no approvals ($group)"
     fi
-  done < <(awk -F '\t' '{mark=($7!="-" && $7!="")?"|OK":""; printf "%s#%s\t%s%s\n",$3,$10,$2,mark}' <<<"$rows" \
-           | awk -F '\t' '{ a[$1] = (a[$1] ? a[$1]":" : "") $2 } END { for (k in a) print k"\t"a[k] }')
+  done
 
-  # (4) "Waiting" stalled > 5 minutes — phone approval was likely lost.
-  while IFS=$'\t' read -r pid cwd status updated_ms alive; do
-    [[ "$alive" != "1" ]] && continue
-    [[ "$status" != waiting* ]] && continue
-    local secs=$(( updated_ms / 1000 ))
-    local age=$(( $(date +%s) - secs ))
-    if (( age >= 300 )); then
-      printf '%b pid %s (%s) stuck "%s" %s — phone approval lost\n' \
-        "$GLYPH_ALERT" "$pid" "$(short_home "$cwd")" "$(truncate_str "$status" 18)" "$(ms_relative "$updated_ms")"
-      n=$((n+1))
-      _di_add "stalled" "warning" "$pid" "" \
-        "pid $pid ($cwd) stuck \"$status\" — phone approval lost"
-    fi
-  done < <(awk -F '\t' '{print $2"\t"$3"\t"$5"\t"$8"\t"$9}' <<<"$rows")
+  # (4) "Waiting" stalled > 5 minutes — phone approval was likely lost. `now`
+  # is fetched once (if anything is even waiting), never once per matched row.
+  if (( ${#_dw_waiting[@]} > 0 )); then
+    local now; now="$(date +%s)"
+    local w wpid wcwd wstatus wupd
+    for w in "${_dw_waiting[@]}"; do
+      IFS=$'\t' read -r wpid wcwd wstatus wupd <<<"$w"
+      local secs=$(( wupd / 1000 ))
+      local age=$(( now - secs ))
+      if (( age >= 300 )); then
+        printf '%b pid %s (%s) stuck "%s" %s — phone approval lost\n' \
+          "$GLYPH_ALERT" "$wpid" "$(short_home "$wcwd")" "$(truncate_str "$wstatus" 18)" "$(ms_relative "$wupd")"
+        _di_add "stalled" "warning" "$wpid" "" \
+          "pid $wpid ($wcwd) stuck \"$wstatus\" — phone approval lost"
+      fi
+    done
+  fi
 
   # (5) Stale session files (PID gone).
-  while IFS=$'\t' read -r pid cwd alive account; do
-    if [[ "$alive" == "0" ]]; then
-      local stale_sdir; stale_sdir="$(_account_dir_or_default "$account")/sessions"
-      printf '%b stale: %s/%s.json (pid gone, %s)\n' \
-        "$GLYPH_DASH" "$(short_home "$stale_sdir")" "$pid" "$(short_home "$cwd")"
-      n=$((n+1))
-      _di_add "stale" "info" "$pid" "" \
-        "stale: $stale_sdir/$pid.json (pid gone, $cwd)"
-    fi
-  done < <(awk -F '\t' '{print $2"\t"$3"\t"$9"\t"$10}' <<<"$rows")
+  local s
+  for s in "${_dw_stale[@]}"; do
+    local spid scwd sacct
+    IFS=$'\t' read -r spid scwd sacct <<<"$s"
+    local stale_sdir; stale_sdir="$(_account_dir_or_default "$sacct")/sessions"
+    printf '%b stale: %s/%s.json (pid gone, %s)\n' \
+      "$GLYPH_DASH" "$(short_home "$stale_sdir")" "$spid" "$(short_home "$scwd")"
+    _di_add "stale" "info" "$spid" "" \
+      "stale: $stale_sdir/$spid.json (pid gone, $scwd)"
+  done
 
   fi # [[ -n "$rows" ]]
 
@@ -745,7 +779,6 @@ _doctor_warnings() {
       printf '    … and %d more\n' "$(( orphan_count - 5 ))"
     fi
     printf '    → reap them: claude-session doctor --reap\n'
-    n=$((n+1))
   fi
 
   # (7) Stuck builds (*:build), regardless of parentage — a plugin/package
@@ -757,7 +790,6 @@ _doctor_warnings() {
     oldest="$(awk -F'\t' 'BEGIN{m=0} {if($2+0>m) m=$2+0} END{print m}' <<<"$stuck_rows")"
     printf '%b %d stuck build process(es) — *:build running >10m (oldest %s) — a build this long is hung\n' \
       "$GLYPH_ALERT" "$stuck_count" "$(_fmt_age_hm "$oldest")"
-    n=$((n+1))
     local sb_pid sb_etimes sb_pcpu sb_comm sb_args
     while IFS=$'\t' read -r sb_pid sb_etimes sb_pcpu sb_comm sb_args; do
       [[ -z "$sb_pid" ]] && continue
@@ -768,24 +800,38 @@ _doctor_warnings() {
 
   # (8) Title index health. A degraded cache never announces itself any other
   # way — a query beside it just falls back to a slower read — so `doctor` is
-  # where a user learns to run the rebuild.
-  local ti_out; ti_out="$(_doctor_title_index || true)"
-  if [[ -n "$ti_out" ]]; then
-    printf '%s\n' "$ti_out"
-    n=$((n + $(wc -l <<<"$ti_out")))
-  fi
+  # where a user learns to run the rebuild. Called directly (not via `$(...)`),
+  # unlike checks (1)-(7)'s row-producing helpers: this one calls _di_add
+  # itself, and a command-substitution subshell would discard that mutation
+  # to _DOCTOR_ISSUES the instant it exits (the same hazard _session_rows'
+  # own comment documents for owner_tmux's cache) — printf still reaches this
+  # function's own stdout exactly as before, just without the extra fork.
+  _doctor_title_index
 
   # (9) Upstream session-state schema drift (see _doctor_upstream_fields).
-  # Neither this check nor (8) feeds _DOCTOR_ISSUES: both are cache/schema
-  # health, not a per-session or per-process issue, and lib/json.sh's
-  # issues/processes sections (checks 1-7 only) never claim to cover them.
-  local uf_out; uf_out="$(_doctor_upstream_fields || true)"
-  if [[ -n "$uf_out" ]]; then
-    printf '%s\n' "$uf_out"
-    n=$((n + $(wc -l <<<"$uf_out")))
-  fi
+  # Now feeds _DOCTOR_ISSUES too (one entry per unknown field, same rule as
+  # check 8): both used to be excluded with the reasoning "cache/schema
+  # health, not a per-session or per-process issue" — but that made the
+  # inventory an undercount, and a monitor trusting the exit status would
+  # never learn its title index degraded or its upstream schema drifted.
+  # Same direct-call reasoning as check (8) above.
+  _doctor_upstream_fields
 
-  return "$n"
+  # _DOCTOR_ISSUES is now the ONE inventory every check (1)-(9) feeds — the
+  # human "N issue(s) flagged" line (cmd_doctor), the plain-doctor exit
+  # status (cmd_doctor), the `ls` warning count, and the JSON issues+processes
+  # item counts (lib/json.sh) all derive from this SAME array, so they cannot
+  # disagree by construction. Returned via $? (not printed): every caller
+  # that wants the count already invokes this function through `$(...)` to
+  # capture its human text, which forks a subshell — the array itself dies
+  # with that subshell, but a plain integer exit status crosses it for free.
+  # Clamped to 250: an exit status is one byte (0-255), so an unclamped count
+  # above that would wrap — 256 real issues silently reported as "0, all
+  # clear" would be the exact silent-success lie this whole mechanism exists
+  # to prevent, just relocated to a different threshold.
+  local total="${#_DOCTOR_ISSUES[@]}"
+  (( total > 250 )) && total=250
+  return "$total"
 }
 
 # Upstream session-state schema drift, check (9). ONE batched jq call across
@@ -829,6 +875,8 @@ _doctor_upstream_fields() {
     esac
     printf "%b unknown session-state field '%s' (upstream schema changed — claude-session may be missing data)\n" \
       "$GLYPH_ALERT" "$k"
+    _di_add "upstream-field" "warning" "" "" \
+      "unknown session-state field '$k' (upstream schema changed — claude-session may be missing data)"
   done <<<"$keys"
   return 0
 }
@@ -850,19 +898,33 @@ _doctor_title_index() {
   if [[ "$TI_STATE" == "cold" && -e "$TITLE_INDEX" ]]; then
     printf '%b title index: present but unreadable/cold (missing or unrecognized version header) — run claude-session _titles --rebuild\n' \
       "$GLYPH_ALERT"
+    _di_add "title-index" "warning" "" "" \
+      "title index: present but unreadable/cold (missing or unrecognized version header) — run claude-session _titles --rebuild"
   fi
-  (( TI_SKIPPED > 0 )) && printf '%b title index: %d unreadable line(s) — run claude-session _titles --rebuild\n' \
-    "$GLYPH_ALERT" "$TI_SKIPPED"
-  (( TI_DUPES > 0 )) && printf '%b title index: %d duplicate line(s) — run claude-session _titles --rebuild\n' \
-    "$GLYPH_ALERT" "$TI_DUPES"
+  if (( TI_SKIPPED > 0 )); then
+    printf '%b title index: %d unreadable line(s) — run claude-session _titles --rebuild\n' \
+      "$GLYPH_ALERT" "$TI_SKIPPED"
+    _di_add "title-index" "warning" "" "" \
+      "title index: $TI_SKIPPED unreadable line(s) — run claude-session _titles --rebuild"
+  fi
+  if (( TI_DUPES > 0 )); then
+    printf '%b title index: %d duplicate line(s) — run claude-session _titles --rebuild\n' \
+      "$GLYPH_ALERT" "$TI_DUPES"
+    _di_add "title-index" "warning" "" "" \
+      "title index: $TI_DUPES duplicate line(s) — run claude-session _titles --rebuild"
+  fi
   # Append-only growth means every mtime/size change adds a line and nothing
   # ever compacts one away — TI_STALE lines are the dead weight from that.
   # _ti_load already sets TI_STATE=stale once it clears both the hysteresis
   # multiple AND the absolute floor (see the threshold comment in
   # lib/titleindex.sh's _ti_load) — never on a bare majority, so this stays
   # an actionable signal instead of firing on ordinary day-to-day use.
-  [[ "$TI_STATE" == "stale" ]] && printf '%b title index: stale — %d superseded line(s), more than 3x the %d live — run claude-session _titles --rebuild\n' \
-    "$GLYPH_ALERT" "$TI_STALE" "$((TI_ENTRIES - TI_STALE))"
+  if [[ "$TI_STATE" == "stale" ]]; then
+    printf '%b title index: stale — %d superseded line(s), more than 3x the %d live — run claude-session _titles --rebuild\n' \
+      "$GLYPH_ALERT" "$TI_STALE" "$((TI_ENTRIES - TI_STALE))"
+    _di_add "title-index" "warning" "" "" \
+      "title index: stale — $TI_STALE superseded line(s), more than 3x the $((TI_ENTRIES - TI_STALE)) live — run claude-session _titles --rebuild"
+  fi
   return 0
 }
 
@@ -993,9 +1055,15 @@ cmd_ls() {
   box_bottom
   LS_COUNT="$i"
 
-  # Warnings summary (compact)
-  local warn_count
-  warn_count="$(_doctor_warnings "$rows" | wc -l || true)"
+  # Warnings summary (compact). Same _DOCTOR_ISSUES-derived count doctor's
+  # exit status and JSON issues/processes sections use — no separate `wc -l`
+  # over printed lines here either (see cmd_doctor's own comment for why that
+  # used to disagree with the real inventory). `_doctor_warnings` is called
+  # directly, not via `$(...)`, so its exit status (the array length,
+  # clamped) crosses back out via $? for free; its human text is discarded
+  # (this summary only ever prints a count, never the lines themselves).
+  local warn_count=0
+  _doctor_warnings "$rows" >/dev/null 2>&1 || warn_count=$?
   if (( warn_count > 0 )); then
     printf '%b %d warning(s) — run: %bclaude-session doctor%b\n' \
       "$GLYPH_ALERT" "$warn_count" "$BOLD" "$N"
@@ -1370,13 +1438,16 @@ _do_reap() {
 
 # ---- doctor ----------------------------------------------------------------
 cmd_doctor() {
-  # --json is its own, self-consistent contract: the exit code is derived from
-  # THIS document's own issues+processes item counts, not from the human
-  # path's `wc -l` line-count mechanism below (which counts decorative lines —
-  # a per-orphan detail line, a "…and N more", a "→ reap them" hint — that
-  # were never meant to be one-issue-per-line and are out of scope to
-  # renumber here). Both paths still agree on the one thing that matters:
-  # 0 issues means all clear, and a real issue always yields a positive exit.
+  # --json and the human path below now derive their count from the exact
+  # SAME inventory (_DOCTOR_ISSUES, populated by _doctor_warnings — every
+  # check (1)-(9) appends to it, see that function's own comment): the
+  # issues+processes item counts here, the exit status below, and the human
+  # "N issue(s) flagged" line cannot disagree by construction, because there
+  # is only one count in the system, read two different ways (a jq length-sum
+  # over the emitted document here; a bash array length via $? on the human
+  # path, since the array itself cannot cross the subshell _doctor_warnings
+  # runs in when its text output is captured — but a plain integer exit
+  # status can). 0 issues means all clear on both paths, always.
   if (( JSON_OUT == 1 )); then
     local envdoc envrc
     envdoc="$(_json_envelope "chats,issues,processes")"; envrc=$?
@@ -1395,9 +1466,8 @@ cmd_doctor() {
   # count. Same string both times, so this is not merely faster but strictly
   # more consistent: one snapshot for the whole `doctor` run.
   local rows; rows="$(_session_rows || true)"
-  local out; out="$(_doctor_warnings "$rows" || true)"
-  local count
-  if [[ -z "$out" ]]; then count=0; else count="$(wc -l <<<"$out")"; fi
+  local out count=0
+  out="$(_doctor_warnings "$rows")" || count=$?
 
   box_top "Doctor"
   if (( count == 0 )); then
@@ -1446,14 +1516,9 @@ cmd_doctor() {
   # docs/doctor-orphans.md promises: "`doctor` (without `--reap`) exits with the
   # number of issues it found — 0 means all clear ... usable directly in scripts
   # or a keepalive-adjacent monitoring loop without parsing its human-readable
-  # output." That was not true: this function simply fell off its end, so the
-  # status came from whatever ran last (box_bottom) and was always 0. A monitor
-  # polling `$?` therefore read "all clear" while the box above it printed six
-  # issues — the exact silent-success failure the contract exists to prevent.
-  #
-  # Clamped to 250: an exit status is one byte, so a raw count would wrap, and
-  # 256 issues reported as 0 would be that same lie again at the far end.
-  (( count > 250 )) && count=250
+  # output." `$count` is already the exact _DOCTOR_ISSUES inventory count
+  # (clamped to 250 inside _doctor_warnings, before it ever became this
+  # exit status) — no second clamp needed here.
   return "$count"
 }
 

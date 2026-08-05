@@ -142,9 +142,24 @@ jq -e '.checksRun|index("stale") != null' >/dev/null <<<"$iss" \
 
 # doctor --json is the same two sections plus processes, and its EXIT CODE is
 # still the issue count — the frozen contract (docs/doctor-orphans.md).
+# (The nonzero-count case is covered in depth by test_doctor_issue_count.sh;
+# here it is only the shape.)
 "$CS" doctor --json >/dev/null 2>&1; drc=$?
 n="$("$CS" doctor --json 2>/dev/null | jq '[.sections.issues.items[], .sections.processes.items[]]|length')"
 assert_eq "$drc" "$n" "doctor --json exit code still equals the issue count" || fail=1
+
+# Cross-section pid TYPE: chats.runtime.pid is a number, so issues/processes must
+# emit pid as a number too — a typed consumer (the Go model) decodes "pid" the
+# same way everywhere. Drive a real processes item from an orphan fixture so the
+# assertion has a non-null pid to check its type on, not just a null.
+orphan_fix="$TEST_HOME/orphan_pids.txt"
+printf '%s\n' '999001 1 900 0.0 npmrundev npm run dev' > "$orphan_fix"
+pdoc="$(ORPHAN_PS_SRC="$orphan_fix" "$CS" doctor --json 2>/dev/null)"
+assert_eq "$(jq -r '.sections.processes.items[0].pid|type' <<<"$pdoc")" "number" \
+  "processes.pid is a number, matching chats.runtime.pid" || fail=1
+# and chats still emits its runtime.pid as a number, not a string
+assert_eq "$(jq -r '.items[]|select(.sessionId=="sid-live").runtime.pid|type' <<<"$ch")" "number" \
+  "chats.runtime.pid is a number" || fail=1
 
 # The upstream-field check: an unknown field in a session file is reported, not ignored.
 jq '. + {brandNewUpstreamField: 1}' "$HOME/.claude/sessions/$pid.json" > "$HOME/.claude/sessions/$pid.json.t" \

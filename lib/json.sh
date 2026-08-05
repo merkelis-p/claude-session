@@ -656,7 +656,10 @@ _json_section_issues() {
   jq -Rn --argjson skipped "$(_json_skips_json)" --arg cr "$checknames" \
     '[inputs | select(length>0) | split("\t") | {
         kind: .[0], severity: .[1],
-        pid: (if .[2]=="" or .[2]=="-" then null else .[2] end),
+        # pid is a NUMBER, matching the chats runtime.pid field — a typed
+        # consumer decodes "pid" the same way in every section. These are
+        # OS/session pids, always numeric; empty or "-" stays null.
+        pid: (if .[2]=="" or .[2]=="-" then null else (.[2]|tonumber) end),
         sessionId: (if .[3]=="" or .[3]=="-" then null else .[3] end),
         text: .[4]
       }] as $items
@@ -674,7 +677,10 @@ _json_section_processes() {
   jq -Rn --argjson skipped "$(_json_skips_json)" \
     '[inputs | select(length>0) | split("\t") | {
         kind: .[0], severity: .[1],
-        pid: (if .[2]=="" or .[2]=="-" then null else .[2] end),
+        # pid is a NUMBER, matching the chats runtime.pid field — a typed
+        # consumer decodes "pid" the same way in every section. These are
+        # OS/session pids, always numeric; empty or "-" stays null.
+        pid: (if .[2]=="" or .[2]=="-" then null else (.[2]|tonumber) end),
         sessionId: (if .[3]=="" or .[3]=="-" then null else .[3] end),
         text: .[4]
       }] as $items

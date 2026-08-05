@@ -12,6 +12,14 @@ if ! command -v _next_clock_epoch >/dev/null 2>&1; then
   # shellcheck disable=SC1091
   . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compat.sh"
 fi
+# Same reasoning, for `cmd_schedule_rm`'s plan/apply protocol (Task 10):
+# tests/test_schedule_cmd.sh sources this file standalone and calls
+# cmd_schedule_rm directly, never through the entrypoint, so plan.sh's
+# builder functions (_plan_reset et al.) must be pulled in the same way.
+if ! command -v _plan_reset >/dev/null 2>&1; then
+  # shellcheck disable=SC1091
+  . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/plan.sh"
+fi
 
 SCHED_DIR="${SCHED_DIR:-$HOME/.config/claude-helpers/schedules}"
 SYSTEMD_USER_DIR="${SYSTEMD_USER_DIR:-$HOME/.config/systemd/user}"
@@ -148,8 +156,27 @@ cmd_schedule_run() {
 
 cmd_schedule_rm() {
   local id="${1:-}"; [[ -n "$id" ]] || { echo "schedule rm: an id is required" >&2; exit 2; }
+  local svc="$SYSTEMD_USER_DIR/claude-schedule-$id.service"
+  local timer="$SYSTEMD_USER_DIR/claude-schedule-$id.timer"
+  local meta_dir="$SCHED_DIR/$id"
+
+  # ${VAR:-0}, not a bare $VAR: tests/test_schedule_cmd.sh sources this file
+  # and calls cmd_schedule_rm directly, without ever going through the
+  # entrypoint's flag parsing — JSON_OUT/DRY_RUN/ASSUME_YES are simply unset
+  # in that shell, and this file runs under `set -u`.
+  _plan_reset "schedule.rm"
+  _plan_argv claude-session schedule rm "$id"
+  _plan_effect remove "$timer"
+  _plan_effect remove "$svc"
+  _plan_effect remove "$meta_dir"
+  _plan_will_lose "the scheduled prompt '$id' (its unit files and metadata directory)"
+  _plan_warn "the journal history for schedule $id (claude-session schedule log $id) is not preserved once the unit files are removed"
+
+  if (( ${DRY_RUN:-0} == 1 )); then _plan_flush; exit 0; fi
+  if (( ${ASSUME_YES:-0} == 1 )); then _plan_require_acks; fi
+
   systemctl --user disable --now "claude-schedule-$id.timer" 2>/dev/null || true
-  rm -f "$SYSTEMD_USER_DIR/claude-schedule-$id.service" "$SYSTEMD_USER_DIR/claude-schedule-$id.timer"
+  rm -f "$svc" "$timer"
   rm -rf "${SCHED_DIR:?}/$id"
   systemctl --user daemon-reload 2>/dev/null || true
   echo "claude-session: removed schedule $id"
@@ -256,8 +283,16 @@ cmd_schedule() {
   # against for `accounts add/rm --json`, and cmd_transfer now guards for
   # every `transfer` subcommand but `log`.
   if (( JSON_OUT == 1 )) && [[ "$sub" != "ls" ]]; then
-    echo "claude-session: --json is not available for 'schedule $sub' in this build" >&2
-    exit 2
+    # `rm` now builds a plan (Task 10) — --json is allowed through for it too,
+    # but only alongside --dry-run/--yes, same rule every other mutating verb
+    # applies (never bare, or a plan/apply-unaware script could silently have
+    # --json ignored instead of erroring on it).
+    if [[ "$sub" == "rm" ]] && (( DRY_RUN == 1 || ASSUME_YES == 1 )); then
+      :
+    else
+      echo "claude-session: --json is not available for 'schedule $sub' in this build" >&2
+      exit 2
+    fi
   fi
   case "$sub" in
     add)       cmd_schedule_add "$*" ;;

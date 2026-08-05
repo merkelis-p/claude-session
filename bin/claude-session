@@ -196,8 +196,10 @@ _all_accounts() {
 # "schedule" covers `schedule ls --json` (lib/json.sh's _json_section_schedules).
 # Like "accounts", both gate by verb as a whole — cmd_transfer/cmd_schedule
 # each reject --json for every OTHER subcommand themselves, the same
-# subcommand-level check cmd_accounts already does.
-_JSON_READY_VERBS="accounts _snapshot _titles ls doctor transfer schedule"
+# subcommand-level check cmd_accounts already does. "kill" is the plan/apply
+# protocol's own use of --json (Task 10) — cmd_kill rejects it itself unless
+# a target session name was given.
+_JSON_READY_VERBS="accounts _snapshot _titles ls doctor transfer schedule kill"
 _json_guard() {
   local verb="${1:-<none>}"
   (( JSON_OUT == 1 )) || return 0
@@ -1351,8 +1353,39 @@ _fzf_pick() {
 }
 
 
+# ---- kill (named, non-interactive) -----------------------------------------
+# `claude-session kill <name>` — a direct-by-name tmux kill, the plan/apply
+# protocol's own mutation (Task 10). Unlike the interactive picker below, this
+# never needs a session index lookup: the caller already knows the tmux
+# session name, exactly like the raw `tmux kill-session -t <name>` this
+# replaces (same real action, same "succeeds either way" exit, now wrapped so
+# --dry-run/--yes get bash's own confirmation wording instead of nothing).
+_cmd_kill_named() {
+  local name="$1"
+
+  _plan_reset "kill.session"
+  _plan_argv claude-session kill "$name"
+  _plan_effect kill "$name"
+  _plan_will_lose "unsaved work in the tmux session $name (the chat transcript is not affected)"
+
+  if (( DRY_RUN == 1 )); then _plan_flush; exit 0; fi
+  if (( ASSUME_YES == 1 )); then _plan_require_acks; fi
+
+  tmux kill-session -t "$name"
+  return 0
+}
+
 # ---- kill (interactive) ----------------------------------------------------
 cmd_kill() {
+  local target="${1:-}"
+  if (( JSON_OUT == 1 )) && [[ -z "$target" ]]; then
+    echo "claude-session: --json is not available for 'kill' without a session name in this build" >&2
+    exit 2
+  fi
+  if [[ -n "$target" ]]; then
+    _cmd_kill_named "$target"
+    return $?
+  fi
   _build_index
   if (( LS_COUNT == 0 )); then
     printf '%bno sessions to kill — nothing running.%b\n' "$DIM" "$N"
@@ -1545,16 +1578,37 @@ _reap_one() {
 # but has made no I/O progress past the stuck threshold can be force-reaped,
 # which is the path this tool lacked (the only prior way out was a bare
 # `pkill -f`, which has no guard at all).
+# Count entries in an _orphan_activity SUBTREE field (pid<\x1f>cmd<\x1f>pcpu,
+# joined by \x1e — see that function's own comment). Used only to say
+# whether a reap victim's disclosed "will lose" text should name a single
+# process or a whole subtree; never touches _orphan_activity/_oa_split
+# themselves. Empty input is 0 subtree entries (not the 1 an empty string
+# would otherwise count as).
+_reap_subtree_count() {
+  local s="$1" n
+  [[ -z "$s" ]] && { printf '0'; return 0; }
+  n=1
+  local rest="$s"
+  while [[ "$rest" == *$'\x1e'* ]]; do n=$((n+1)); rest="${rest#*$'\x1e'}"; done
+  printf '%s' "$n"
+}
+
 _do_reap() {
   local orphan_ps_rows; orphan_ps_rows="$(_ps_snapshot_rows || true)"
   local orphan_rows; orphan_rows="$(_orphan_rows "$orphan_ps_rows" || true)"
   if [[ -z "$orphan_rows" ]]; then
+    if (( DRY_RUN == 1 )); then
+      _plan_reset "doctor.reap"
+      _plan_argv claude-session doctor --reap
+      _plan_flush
+      exit 0
+    fi
     printf '%bnothing to reap%b\n' "$DIM" "$N"
     return 0
   fi
 
   local -a idle_pids=() active_pids=() suspect_pids=()
-  local -A act_reason act_state
+  local -A act_reason act_state act_args act_subtree
   local pid etimes pcpu comm args act state reason subtree
   while IFS=$'\t' read -r pid etimes pcpu comm args; do
     [[ -z "$pid" ]] && continue
@@ -1562,12 +1616,52 @@ _do_reap() {
     _oa_split "$act"; state="$OA_STATE"; reason="$OA_REASON"; subtree="$OA_SUBTREE"
     act_state[$pid]="$state"
     act_reason[$pid]="$reason"
+    act_args[$pid]="$args"
+    act_subtree[$pid]="$subtree"
     case "$state" in
       active)  active_pids+=("$pid") ;;
       suspect) suspect_pids+=("$pid") ;;
       *)       idle_pids+=("$pid") ;;
     esac
   done <<<"$orphan_rows"
+
+  # ---- build the plan (advisory only) ----------------------------------------
+  # Only IDLE pids ever become a `kill` effect: an active or suspect orphan is
+  # never disclosed as something this plan would kill, AT ANY CONFIRMATION
+  # LEVEL — there is no "reap all". This mirrors the real reap_pids
+  # computation below for "active" (never included, regardless of --force —
+  # see this function's own header and docs/doctor-orphans.md) and is
+  # deliberately MORE conservative than it for "suspect": --force DOES still
+  # reap a suspect for real (unchanged), but the plan discloses that only as
+  # a warning, never as a kill effect, so a --dry-run preview can never be
+  # mistaken for "this plan just killed everything."
+  local reap_total=$(( ${#idle_pids[@]} + ${#active_pids[@]} + ${#suspect_pids[@]} ))
+  local reap_skipped=$(( ${#active_pids[@]} + ${#suspect_pids[@]} ))
+  _plan_reset "doctor.reap"
+  _plan_argv claude-session doctor --reap
+  (( FORCE == 1 )) && _plan_argv --force
+  local rp
+  for rp in "${idle_pids[@]+"${idle_pids[@]}"}"; do
+    _plan_effect kill "$rp"
+    local rp_n; rp_n="$(_reap_subtree_count "${act_subtree[$rp]:-}")"
+    if (( rp_n > 1 )); then
+      _plan_will_lose "pid $rp and its subtree ($rp_n processes): $(_short_cmd "${act_args[$rp]:-}")"
+    else
+      _plan_will_lose "pid $rp ($(_short_cmd "${act_args[$rp]:-}"))"
+    fi
+  done
+  if (( reap_total > 0 )); then
+    _plan_warn "reap ${#idle_pids[@]} of $reap_total — $reap_skipped skipped (active work in subtree)"
+  fi
+  for rp in "${active_pids[@]+"${active_pids[@]}"}"; do
+    _plan_warn "pid $rp skipped — ${act_reason[$rp]:-active work in subtree}"
+  done
+  for rp in "${suspect_pids[@]+"${suspect_pids[@]}"}"; do
+    _plan_warn "pid $rp skipped — ${act_reason[$rp]:-suspected hung, needs --force}"
+  done
+
+  if (( DRY_RUN == 1 )); then _plan_flush; exit 0; fi
+  if (( ASSUME_YES == 1 )); then _plan_require_acks; fi
 
   printf '\n%borphans found:%b\n' "$BOLD" "$N"
   while IFS=$'\t' read -r pid etimes pcpu comm args; do
@@ -1610,7 +1704,13 @@ _do_reap() {
         printf '%bcancelled%b\n' "$DIM" "$N"
         return 0
       fi
-    else
+    elif (( ASSUME_YES == 0 )); then
+      # --yes already cleared _plan_require_acks above (there is nothing to
+      # ack for reap — idle-only killing needs no disclosed condition beyond
+      # what's already printed), so it stands in for this same "a human
+      # agreed" fact and skips straight to the reap below. A bare
+      # non-interactive call with neither is unchanged: hard refusal,
+      # --force the only override (docs/doctor-orphans.md, "Exit status").
       printf '%bclaude-session doctor --reap: refusing to kill without confirmation on a non-interactive stdin — pass --force to proceed unattended%b\n' \
         "$R" "$N" >&2
       return 2
@@ -1679,6 +1779,27 @@ cmd_doctor() {
   # path, since the array itself cannot cross the subshell _doctor_warnings
   # runs in when its text output is captured — but a plain integer exit
   # status can). 0 issues means all clear on both paths, always.
+  # --reap + (--json or --dry-run) takes priority over the plain envelope AND
+  # the human box below: neither has anything to do with reap's own
+  # plan/apply protocol (Task 10), and letting either run first would either
+  # silently ignore --reap (the envelope always `exit`s itself) or — worse —
+  # print the human "Doctor" box FIRST and then _do_reap's JSON plan right
+  # after it on the same stdout, breaking a `--dry-run` caller's JSON parse.
+  # --dry-run alone (no --json) must bypass this exactly like `transfer
+  # <sid> --to=x --dry-run` already does (T9): the plan IS the answer, not
+  # something appended after a human rendering. --json bare (no --dry-run/
+  # --yes) is still refused — the plan/apply protocol's own use of it, same
+  # rule every other mutating verb applies. The NON-json, NON-dry-run
+  # `doctor --reap` path is untouched: see the unchanged `if (( REAP == 1 ))`
+  # block below the human box print.
+  if (( REAP == 1 )) && (( JSON_OUT == 1 || DRY_RUN == 1 )); then
+    if (( JSON_OUT == 1 )) && (( DRY_RUN == 0 && ASSUME_YES == 0 )); then
+      echo "claude-session: --json is not available for 'doctor --reap' in this build (use --dry-run or --yes)" >&2
+      exit 2
+    fi
+    _do_reap
+    return $?
+  fi
   if (( JSON_OUT == 1 )); then
     local envdoc envrc
     envdoc="$(_json_envelope "chats,issues,processes")"; envrc=$?
@@ -1763,8 +1884,15 @@ cmd_accounts() {
   # its ordinary interactive/human path, discarding the --json request instead
   # of erroring on it.
   if (( JSON_OUT == 1 )) && [[ "$sub" != "ls" ]]; then
-    echo "claude-session: --json is not available for 'accounts $sub' in this build" >&2
-    exit 2
+    # `rm` now builds a plan (Task 10) — --json is allowed through for it too,
+    # but only alongside --dry-run/--yes (the plan/apply protocol's own use
+    # of it), never bare, same rule every other mutating verb applies.
+    if [[ "$sub" == "rm" ]] && (( DRY_RUN == 1 || ASSUME_YES == 1 )); then
+      :
+    else
+      echo "claude-session: --json is not available for 'accounts $sub' in this build" >&2
+      exit 2
+    fi
   fi
   case "$sub" in
     add) cmd_accounts_add "$@" ;;
@@ -1832,6 +1960,21 @@ cmd_accounts_rm() {
   local dir
   dir="$(_account_config_dir "$name")" || { echo "claude-session accounts rm: unknown account '$name'" >&2; exit 2; }
   [[ -f "$ACCOUNTS_CONF" ]] || { echo "claude-session accounts rm: no accounts.conf found" >&2; exit 2; }
+
+  _plan_reset "accounts.rm"
+  _plan_argv claude-session accounts rm "$name"
+  _plan_effect write "$ACCOUNTS_CONF"
+  _plan_will_lose "the registry entry for '$name'"
+  # This never actually runs — see the unchanged `echo` below, printed for a
+  # human either way. The credential dir is deliberately kept: disclosing the
+  # exact command this refuses to run (rather than a vague "not deleted") is
+  # the whole point of a plan/apply protocol built on bash owning its own
+  # safety wording.
+  _plan_warn "the credential directory is kept, not deleted — this deliberately does NOT run: rm -rf $(printf '%q' "$dir")"
+
+  if (( DRY_RUN == 1 )); then _plan_flush; exit 0; fi
+  if (( ASSUME_YES == 1 )); then _plan_require_acks; fi
+
   local tmp; tmp="$(mktemp)"
   local grep_rc=0
   grep -vE "^account[[:space:]]+$name([[:space:]]|\$)" "$ACCOUNTS_CONF" > "$tmp" || grep_rc=$?
@@ -2150,8 +2293,8 @@ case "$a1" in
     _titles_window "$(_account_dir_or_default "${ACCOUNT:-default}")" "${_tw_sids[@]+"${_tw_sids[@]}"}"
     exit $? ;;
   kill)
-    if [[ -z "$a2" ]]; then cmd_kill; else tmux kill-session -t "$a2"; fi
-    exit 0 ;;
+    cmd_kill "$a2"
+    exit $? ;;
 esac
 
 if (( SHOW_VERSION == 1 )); then

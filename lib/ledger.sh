@@ -321,6 +321,18 @@ cmd_transfer_undo() {
   to_dir="$(_account_dir_or_default "$to")"; from_dir="$(_account_dir_or_default "$from")"
   dst_jsonl="$(find "$to_dir/projects" -maxdepth 2 -name "$sid.jsonl" 2>/dev/null | head -1)"
   [[ -n "$dst_jsonl" ]] || { echo "claude-session transfer undo: dest copy for $sid not found in $to (already gone?)" >&2; exit 1; }
+  local slug from_proj; slug="$(basename "$(dirname "$dst_jsonl")")"; from_proj="$from_dir/projects/$slug"
+
+  # ---- build the plan (advisory only) ---------------------------------------
+  _plan_reset "transfer.undo"
+  _plan_argv claude-session transfer undo "$oid"
+  _plan_target "$from" "$sid" "$title" "$dst_jsonl"
+  if [[ "$verb" == "move" ]]; then
+    _plan_effect write "$from_proj/$sid.jsonl"
+  fi
+  _plan_effect remove "$dst_jsonl"
+  _plan_will_lose "the destination copy under '$to' (this reverses ledger entry $oid)"
+
   local dmt
   if ! dmt="$(_file_mtime "$dst_jsonl")"; then
     echo "claude-session transfer undo: cannot read the destination's mtime — refusing to undo blind (use --force to override)" >&2
@@ -328,17 +340,26 @@ cmd_transfer_undo() {
     dmt=0
   fi
   if (( dmt > ts + 2 )); then
-    if [[ "$FORCE" == 0 ]] && ! _cs_interactive; then
-      echo "claude-session transfer undo: dest copy changed since transfer — refusing (resumed?). Use --force." >&2; exit 2
-    fi
-    if [[ "$FORCE" == 0 ]]; then
-      printf 'dest copy of %s changed since it moved. Undo discards that newer copy. Proceed? [y/N] ' "$sid" >&2
-      local ans; read -r ans; [[ "$ans" == [yY] ]] || { echo "cancelled" >&2; exit 2; }
+    if _cs_interactive; then
+      if [[ "$FORCE" == 0 ]]; then
+        printf 'dest copy of %s changed since it moved. Undo discards that newer copy. Proceed? [y/N] ' "$sid" >&2
+        local ans; read -r ans; [[ "$ans" == [yY] ]] || { echo "cancelled" >&2; exit 2; }
+      fi
+    elif [[ "$FORCE" == 0 ]]; then
+      local dtext="the destination changed after the transfer; undo discards that newer copy (transfer $(_epoch_to_human "$ts" || echo '?'), destination $(_epoch_to_human "$dmt" || echo '?'))"
+      if (( DRY_RUN == 1 || ASSUME_YES == 1 )); then
+        _plan_confirm divergence "$dtext"
+      else
+        echo "claude-session transfer undo: dest copy changed since transfer — refusing (resumed?). Use --force." >&2; exit 2
+      fi
     fi
   fi
+
+  if (( DRY_RUN == 1 )); then _plan_flush; exit 0; fi
+  if (( ASSUME_YES == 1 )); then _plan_require_acks; fi
+
   local newid
   if [[ "$verb" == "move" ]]; then
-    local slug from_proj; slug="$(basename "$(dirname "$dst_jsonl")")"; from_proj="$from_dir/projects/$slug"
     mkdir -p "$from_proj"
     newid="$(FORCE=1 _ledger_append "$sid" "$title" "$to" "$from" "move" "$oid" "")" \
       || { echo "claude-session transfer undo: ledger write failed — aborting, nothing moved" >&2; exit 1; }
@@ -359,8 +380,22 @@ cmd_transfer_redo() {
   [[ -n "$id" ]] || { echo "claude-session transfer redo: an entry id is required (see: claude-session transfer log)" >&2; exit 2; }
   entry="$(jq -c --arg a "$id" 'select(.id==$a)' "$LEDGER_FILE" 2>/dev/null | tail -1)"
   [[ -n "$entry" ]] || { echo "claude-session transfer redo: no ledger entry with id '$id'" >&2; exit 1; }
-  local sid from to verb
-  sid="$(jq -r .sid <<<"$entry")"; from="$(jq -r .from <<<"$entry")"; to="$(jq -r .to <<<"$entry")"; verb="$(jq -r .verb <<<"$entry")"
+  local sid from to verb title
+  sid="$(jq -r .sid <<<"$entry")"; from="$(jq -r .from <<<"$entry")"; to="$(jq -r .to <<<"$entry")"
+  verb="$(jq -r .verb <<<"$entry")"; title="$(jq -r .title <<<"$entry")"
+
+  # A THIN plan, for --dry-run only: it exists so `transfer redo <id> --dry-run`
+  # names itself "transfer.redo" (Task 16's mutation-name mapping), without
+  # ever touching the filesystem. The real work below re-enters cmd_transfer,
+  # which builds its OWN "transfer.move"/"transfer.copy" plan and re-runs
+  # every guard (duplicate/round-trip/never-clobber) for real — this function
+  # never replays a decision, only names the entry it is about to re-apply.
+  _plan_reset "transfer.redo"
+  _plan_argv claude-session transfer redo "$id"
+  _plan_target "$to" "$sid" "$title" ""
+  _plan_effect "$verb" "$sid"
+  if (( DRY_RUN == 1 )); then _plan_flush; exit 0; fi
+
   echo "claude-session: redoing $id — $verb $sid $from → $to" >&2
   TO_ACCOUNT="$to"; FROM_ACCOUNT="$from"; REDO_OF="$id"
   TRANSFER_MOVE=0; [[ "$verb" == "move" ]] && TRANSFER_MOVE=1
@@ -369,11 +404,30 @@ cmd_transfer_redo() {
 
 cmd_transfer_prune() {
   local id="${1:-}"
-  [[ -n "$id" ]] || { echo "claude-session transfer prune: an entry id is required" >&2; exit 2; }
   [[ -f "$LEDGER_FILE" ]] || { echo "claude-session transfer prune: no ledger" >&2; exit 1; }
+  # No id given: default to the most recent entry, same convention `transfer
+  # undo` already uses — lets `transfer prune --dry-run` (no id) answer with
+  # a real plan instead of a bare "an id is required" refusal.
+  if [[ -z "$id" ]]; then
+    id="$(jq -r '.id' "$LEDGER_FILE" 2>/dev/null | tail -1)"
+    [[ -n "$id" ]] || { echo "claude-session transfer prune: an entry id is required (ledger is empty)" >&2; exit 2; }
+  fi
   local found; found="$(jq -c --arg a "$id" 'select(.id==$a)' "$LEDGER_FILE" 2>/dev/null | head -1)"
   [[ -n "$found" ]] || { echo "claude-session transfer prune: no entry id '$id'" >&2; exit 1; }
-  if [[ "$FORCE" == 0 ]] && ! _cs_interactive; then
+  local sid; sid="$(jq -r .sid <<<"$found")"
+
+  _plan_reset "transfer.prune"
+  _plan_argv claude-session transfer prune "$id"
+  _plan_will_lose "the ledger entry $id ($sid) — record only, chat data untouched"
+
+  if (( DRY_RUN == 1 )); then _plan_flush; exit 0; fi
+  if (( ASSUME_YES == 1 )); then _plan_require_acks; fi
+
+  # --yes stands in for the same "a human agreed" fact the [y/N] prompt below
+  # would have collected — added on top of the existing FORCE/interactive
+  # split, so a bare non-interactive call that never opted into the protocol
+  # (no --dry-run, no --yes) keeps refusing exactly as before.
+  if [[ "$FORCE" == 0 ]] && ! _cs_interactive && (( ASSUME_YES == 0 )); then
     echo "claude-session transfer prune: needs confirmation — re-run with --force" >&2; exit 2
   fi
   if [[ "$FORCE" == 0 ]] && _cs_interactive; then
@@ -398,14 +452,13 @@ cmd_transfer() {
   # cmd_accounts already guards against for `accounts add/rm --json`.
   # --dry-run/--yes are the plan/apply protocol's own use of --json: --dry-run
   # asks for the plan, --yes asks for its re-emission on an unmet confirmation
-  # (exit 3). Only the plain sid-based call builds a plan — undo/redo/prune
-  # don't, and stay refused exactly as before.
-  if (( JSON_OUT == 1 )) && [[ "${1:-}" != "log" ]]; then
-    if [[ "${1:-}" == "undo" || "${1:-}" == "redo" || "${1:-}" == "prune" ]] \
-       || (( DRY_RUN == 0 && ASSUME_YES == 0 )); then
-      echo "claude-session: --json is not available for 'transfer ${1:-}' in this build" >&2
-      exit 2
-    fi
+  # (exit 3). undo/redo/prune now build a plan too (Task 10) — same rule as
+  # the plain sid-based call, no longer a special case: --json is only ever
+  # honored alongside --dry-run or --yes, never bare (see test_json.sh's
+  # "transfer undo --json is a hard error, not a silently-ignored flag").
+  if (( JSON_OUT == 1 )) && [[ "${1:-}" != "log" ]] && (( DRY_RUN == 0 && ASSUME_YES == 0 )); then
+    echo "claude-session: --json is not available for 'transfer ${1:-}' in this build" >&2
+    exit 2
   fi
   case "${1:-}" in
     log)   shift; cmd_transfer_log "$@"; return ;;

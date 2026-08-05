@@ -736,7 +736,7 @@ _json_section_processes() {
       while IFS=$'\t' read -r pid etimes pcpu comm args; do
         [[ -z "$pid" ]] && continue
         act="$(_orphan_activity "$pid" "$ps_rows")"
-        IFS=$'\t' read -r state reason subtree <<<"$act"
+        _oa_split "$act"; state="$OA_STATE"; reason="$OA_REASON"; subtree="$OA_SUBTREE"
         cmd="$(_short_cmd "$args")"
         case "$state" in
           idle)    reapable="true";  blockedby="" ;;
@@ -754,7 +754,7 @@ _json_section_processes() {
       while IFS=$'\t' read -r pid etimes pcpu comm args; do
         [[ -z "$pid" ]] && continue
         act="$(_orphan_activity "$pid" "$ps_rows")"
-        IFS=$'\t' read -r state reason subtree <<<"$act"
+        _oa_split "$act"; state="$OA_STATE"; reason="$OA_REASON"; subtree="$OA_SUBTREE"
         cmd="$(_short_cmd "$args")"
         case "$state" in
           idle)    reapable="true";  blockedby="" ;;

@@ -678,6 +678,21 @@ _orphan_activity() {
   printf 'idle\t\t%s' "$sub"
 }
 
+# Split _orphan_activity's `state<TAB>reason<TAB>subtree` output into three vars
+# WITHOUT the field collapse that `IFS=$'\t' read -r a b c` suffers: tab is IFS
+# *whitespace*, so `read` merges a run of adjacent tabs into one delimiter — and
+# the idle path emits an EMPTY reason (`idle\t\t<subtree>`), whose two tabs then
+# collapse, dropping the subtree into `reason` and leaving subtree empty. That is
+# the exact hazard `_SESSION_JQ`'s `def d` and the ledger/schedules `-` sentinels
+# already guard elsewhere; parameter expansion cuts on the first tab each time
+# and never collapses, so an empty middle field stays empty.
+# Sets OA_STATE / OA_REASON / OA_SUBTREE.
+_oa_split() {
+  local a="$1"
+  OA_STATE="${a%%$'\t'*}"; a="${a#*$'\t'}"
+  OA_REASON="${a%%$'\t'*}"; OA_SUBTREE="${a#*$'\t'}"
+}
+
 # ---- doctor checks ---------------------------------------------------------
 # Return value: array of warning lines, plus an exit-code summary.
 # Stdout = warnings (one per line, possibly colored); returns count via $?
@@ -875,7 +890,7 @@ _doctor_warnings() {
     while IFS=$'\t' read -r pid etimes pcpu comm args; do
       [[ -z "$pid" ]] && continue
       act="$(_orphan_activity "$pid" "$ps_rows")"
-      IFS=$'\t' read -r state reason subtree <<<"$act"
+      _oa_split "$act"; state="$OA_STATE"; reason="$OA_REASON"; subtree="$OA_SUBTREE"
       _oa_status[$pid]="$state"
       _oa_reason[$pid]="$reason"
       case "$state" in
@@ -940,7 +955,7 @@ _doctor_warnings() {
     while IFS=$'\t' read -r sb_pid sb_etimes sb_pcpu sb_comm sb_args; do
       [[ -z "$sb_pid" ]] && continue
       sb_act="$(_orphan_activity "$sb_pid" "$ps_rows")"
-      IFS=$'\t' read -r sb_state sb_reason sb_sub <<<"$sb_act"
+      _oa_split "$sb_act"; sb_state="$OA_STATE"; sb_reason="$OA_REASON"; sb_sub="$OA_SUBTREE"
       case "$sb_state" in
         active)  sb_note="still active (${sb_reason}) — a build this long is not hung here, reap would skip it" ;;
         suspect) sb_note="${sb_reason} — reap skips it by default, doctor --reap --force overrides" ;;
@@ -1543,7 +1558,7 @@ _do_reap() {
   while IFS=$'\t' read -r pid etimes pcpu comm args; do
     [[ -z "$pid" ]] && continue
     act="$(_orphan_activity "$pid" "$orphan_ps_rows")"
-    IFS=$'\t' read -r state reason subtree <<<"$act"
+    _oa_split "$act"; state="$OA_STATE"; reason="$OA_REASON"; subtree="$OA_SUBTREE"
     act_state[$pid]="$state"
     act_reason[$pid]="$reason"
     case "$state" in

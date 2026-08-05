@@ -52,6 +52,17 @@ idle="$(jq -c '.items[]|select(.pid==901999)' <<<"$p")"
 assert_eq "$(jq -r '.activity.state' <<<"$idle")" "idle" "a genuinely idle orphan is idle" || fail=1
 assert_eq "$(jq -r '.reapable' <<<"$idle")" "true" "an idle orphan is reapable" || fail=1
 assert_eq "$(jq -r '.class' <<<"$idle")" "orphan" "class distinguishes orphan from stuck-build" || fail=1
+# The subtree must be emitted on the IDLE path too — it is the reapable, most
+# common case, and it is exactly where the empty-reason field between two tabs
+# collapses under `IFS=$'\t' read` (tab is IFS whitespace, so `idle\t\t<sub>`
+# merges the two tabs and drops the subtree into reason). A regression there
+# reappears as reason="<raw \x1f string>" and subtree=[].
+assert_eq "$(jq -r '.activity.subtree|length' <<<"$idle")" "1" \
+  "an idle orphan still emits its examined subtree (the empty reason must not collapse the column)" || fail=1
+assert_eq "$(jq -r '.activity.reason' <<<"$idle")" "null" \
+  "an idle orphan has no reason (null), not a mangled subtree string" || fail=1
+assert_contains "$(jq -r '[.activity.subtree[].cmd]|join(" ")' <<<"$idle")" "npm run dev" \
+  "and the subtree carries the examined process's cmd, not a raw delimiter blob" || fail=1
 
 # One `ps` snapshot for the whole section: _orphan_activity must not re-read it
 # per orphan. Counted with a wrapper ahead of PATH.

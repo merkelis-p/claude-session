@@ -325,3 +325,32 @@ never the target.** The app drops to a 5 s poll interval rather than the
 target being waived — a slow poll that still answers correctly is
 recoverable; a target quietly loosened to match whatever the code currently
 does is how a regression stops being visible at all.
+
+### Measured actuals
+
+`tests/test_perf.sh` records these, on the stated fixture (**2 accounts, 2
+session files each, 2 transcripts each**, title index warm), measured
+2026-08-05 on the development host:
+
+| metric | value |
+|---|---|
+| `_snapshot --only=chats,issues,accounts` — jq forks | 12 (fixed; see below) |
+| — tmux forks | 1 |
+| — ps forks | 1 |
+| `_snapshot --json` (all six sections) — ps forks | 1 |
+| `_titles --sids=<2 sids>` — jq forks | 1 |
+| **`_snapshot --only=chats,issues,accounts` p95** | **~245 ms** (within the 400 ms target) |
+
+The jq count is **fixed per-poll overhead — not per row.** It is one batched
+session-read per account-with-sessions, one main `jq` per emitted section, one
+`_json_skips_json` per section that has skips, plus `_json_core`, the
+envelope's validating `jq -c .`, the upstream-field check, and the titlesIndex
+object. `tests/test_perf.sh` asserts a **ceiling of 14** as a backstop and,
+more importantly, asserts the count is **identical at 2 and at 16 sessions per
+account** — that equality, not the ceiling, is what proves the poll's cost is
+independent of how many chats an account holds (the point of the windowed
+design). A per-row fork fails the equality immediately, even though it could
+hide under a generous ceiling.
+
+**Task 18 sets the app's poll cadence from this number: ≤ 400 ms → 2 s,
+otherwise 5 s.**

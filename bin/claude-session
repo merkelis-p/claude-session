@@ -191,7 +191,12 @@ _all_accounts() {
 # "accounts" covers `accounts ls --json` (lib/json.sh's _json_section_accounts);
 # "_snapshot" is the internal envelope verb, also from lib/json.sh; "_titles" is
 # the lazy per-window title resolver (lib/titleindex.sh's _titles_window).
-_JSON_READY_VERBS="accounts _snapshot _titles ls doctor"
+# "transfer" covers `transfer log --json` (lib/json.sh's _json_section_ledger);
+# "schedule" covers `schedule ls --json` (lib/json.sh's _json_section_schedules).
+# Like "accounts", both gate by verb as a whole — cmd_transfer/cmd_schedule
+# each reject --json for every OTHER subcommand themselves, the same
+# subcommand-level check cmd_accounts already does.
+_JSON_READY_VERBS="accounts _snapshot _titles ls doctor transfer schedule"
 _json_guard() {
   local verb="${1:-<none>}"
   (( JSON_OUT == 1 )) || return 0

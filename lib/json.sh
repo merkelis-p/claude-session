@@ -802,3 +802,347 @@ _json_section_processes() {
        errors:[], items:$items}' \
     <<<"$rows"
 }
+
+# ---- ledger section ----------------------------------------------------------
+# Entrypoint dependencies read at call time only (lib/ledger.sh's own
+# convention, applied here since this is the one place json.sh reads them):
+# LEDGER_FILE, TRANSFER_LIMIT, _account_dir_or_default, _compat_os.
+#
+# One jq over $LEDGER_FILE producing the raw window — newest ts first, capped
+# at TRANSFER_LIMIT (0 = unbounded, the same convention _build_transfer_index
+# already uses for its own limit argument) — plus the FILE-WIDE undoOf set, so
+# "already undone" stays correct even when the undo entry itself falls outside
+# the window (it normally sorts near the top, but nothing guarantees that for
+# a small --limit). Titles are neutralized for tab/newline the same way
+# accounts' description field is: free text (a chat title) can carry either,
+# and an embedded newline would otherwise split one entry into two "rows" for
+# the TSV parse below — the exact hazard _json_section_accounts' own comment
+# already documents for account descriptions. `join("\t")`, not `@tsv`: @tsv
+# doubles a literal backslash in the title along with escaping the tab, which
+# is not what a title that happens to contain a backslash should come out as.
+#
+# The renamed field: the ledger stores the entry's own timestamp as `ts`; this
+# section reports it as `transferTs`, alongside `destMtime`, because those two
+# instants are what every downstream divergence check actually compares — a
+# bare `ts` next to `destMtime` invites the reader to guess which side is
+# which.
+_json_section_ledger() {
+  _json_skip_reset
+  if [[ ! -f "$LEDGER_FILE" ]]; then
+    _json_skip "endpoints" "no ledger file yet"
+    jq -n --argjson skipped "$(_json_skips_json)" \
+      '{status:"ok", checksRun:["ledger","endpoints","divergence"], checksSkipped:$skipped,
+        errors:[], limit:0, total:0, truncated:false, items:[]}'
+    return 0
+  fi
+
+  local limit="${TRANSFER_LIMIT:-50}"
+  [[ "$limit" =~ ^[0-9]+$ ]] || limit=50
+
+  # First fork: the whole file, slurped once, so the undoOf set is computed
+  # over EVERY entry while the window (what actually becomes `items`) is
+  # capped at $limit. Line 1 of the output is the file's total entry count (a
+  # bare integer, never a tab/newline); every line after that is one windowed
+  # entry as a TSV row. `-s` (slurp) is why a genuinely malformed line fails
+  # the WHOLE parse rather than silently dropping just that line — a corrupt
+  # ledger is an error, not a gap.
+  # `//` substitutes only for null/false, never an empty string, and — the
+  # sharper hazard — tab is IFS *whitespace*, so a genuinely empty field
+  # between two others is not just wrong, it SHIFTS every field after it one
+  # slot left the moment bash `read` sees the resulting adjacent tabs as one
+  # collapsed delimiter (measured: an all-null undoOf/redoOf on a fresh
+  # move/copy entry landed its own isundone flag in the undoOf column and
+  # pushed destExists/sourceExists/destMtime out of the row entirely). Every
+  # field that can be null OR "" gets the same non-empty sentinel
+  # _session_rows already uses for exactly this reason: "-", decoded back to
+  # null (or, for title, back to "") in the closing jq below — never emitted
+  # as a bare empty string into a tab-delimited row.
+  local raw rc
+  raw="$(jq -r -s --argjson limit "$limit" '
+    . as $all
+    | ($all | map(.undoOf) | map(select(. != null))) as $undone
+    | ($all | sort_by(-.ts)) as $sorted
+    | ( [ ($all|length) | tostring ]
+        + [ (if $limit>0 then $sorted[0:$limit] else $sorted end)[]
+            | [ .id, (.ts|tostring),
+                (if (.sid // "")=="" then "-" else .sid end),
+                (if (.title // "")=="" then "-" else (.title | gsub("[\t\n]"; " ")) end),
+                .from, .to, .verb,
+                (if (.undoOf // "")=="" then "-" else .undoOf end),
+                (if (.redoOf // "")=="" then "-" else .redoOf end),
+                (if (.id as $i | ($undone | index($i))) then "1" else "0" end)
+              ] | join("\t")
+          ]
+      )[]
+  ' "$LEDGER_FILE" 2>/dev/null)"; rc=$?
+
+  local errors_json="[]"
+  if (( rc != 0 )); then
+    errors_json='["the ledger file could not be parsed as JSON — entries may be corrupted"]'
+    raw=""
+  fi
+
+  local total=0 rows="" _first=1 _line
+  while IFS= read -r _line; do
+    if (( _first )); then
+      [[ "$_line" =~ ^[0-9]+$ ]] && total="$_line"
+      _first=0
+      continue
+    fi
+    [[ -n "$_line" ]] && rows+="$_line"$'\n'
+  done <<<"$raw"
+
+  # Pass 1: resolve endpoints via a glob EXPANSION — bash's own readdir
+  # matching, never a `find` fork (_build_transfer_index already established
+  # that a per-file find/stat fork is the exact cost this module exists to
+  # avoid). Account directories are resolved through _account_dir_or_default
+  # once PER DISTINCT ACCOUNT NAME, memoized in ACCTDIR — not once per ledger
+  # entry — because capturing that function's result through `$(...)` forks
+  # regardless of the function body being fork-free, and ledger entries repeat
+  # the same handful of account names far more often than they introduce a new
+  # one. Destination paths that resolve are collected into stat_paths,
+  # deferred to ONE batched `stat` after this loop (same shape as the chats
+  # section's own leftover-stat batching above) instead of one `_file_mtime`
+  # (its own stat fork) per entry.
+  #
+  # `shopt -s nullglob` is NOT optional here: without it, a glob that matches
+  # nothing expands to its own unexpanded literal pattern string (one
+  # element, asterisk and all) instead of zero elements — so `hits` reads as
+  # non-empty and every endpoint looks like it exists, regardless of whether
+  # a file is actually there. This is a global, process-wide shell option
+  # (not scoped to this function), and `_json_section_ledger` can run as the
+  # very first thing a process does (`--only=ledger`, or `transfer
+  # log --json`) with no earlier section (chats' own transcript scan, via
+  # _build_transfer_index) to have already turned it on — so it cannot be
+  # left implicit here the way it can in a function only ever reached after
+  # one of those.
+  shopt -s nullglob
+  local -A ACCTDIR=()
+  local -a stage=() stat_paths=()
+  local id ts sid title from to verb undoof redoof isundone
+  while IFS=$'\t' read -r id ts sid title from to verb undoof redoof isundone; do
+    [[ -n "$id" ]] || continue
+    [[ -n "${ACCTDIR[$to]+x}" ]]   || ACCTDIR[$to]="$(_account_dir_or_default "$to")"
+    [[ -n "${ACCTDIR[$from]+x}" ]] || ACCTDIR[$from]="$(_account_dir_or_default "$from")"
+    local to_dir="${ACCTDIR[$to]}" from_dir="${ACCTDIR[$from]}"
+    local -a hits=()
+    local dest_exists=false src_exists=false dest_path=""
+    if [[ -n "$sid" && "$sid" != "-" ]]; then
+      hits=("$to_dir/projects"/*/"$sid.jsonl")
+      if (( ${#hits[@]} > 0 )); then dest_exists=true; dest_path="${hits[0]}"; stat_paths+=("$dest_path"); fi
+      hits=("$from_dir/projects"/*/"$sid.jsonl")
+      (( ${#hits[@]} > 0 )) && src_exists=true
+    fi
+    local _tuple
+    printf -v _tuple '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s' \
+      "$id" "$ts" "$sid" "$title" "$from" "$to" "$verb" "$undoof" "$redoof" "$isundone" \
+      "$dest_exists" "$src_exists" "$dest_path"
+    stage+=("$_tuple")
+  done <<<"$rows"
+
+  local -A MTIME=()
+  if (( ${#stat_paths[@]} > 0 )); then
+    local sp sm
+    while IFS=$'\t' read -r sp sm; do
+      [[ -z "$sp" ]] && continue
+      MTIME[$sp]="$sm"
+    done < <(
+      case "$(_compat_os)" in
+        darwin) stat -f $'%N\t%m' "${stat_paths[@]}" 2>/dev/null ;;
+        *)      stat -c $'%n\t%Y' "${stat_paths[@]}" 2>/dev/null ;;
+      esac
+    )
+  fi
+
+  # Pass 2: fold destMtime in and hand the whole window to ONE closing jq —
+  # `printf -v`, not `final+="$(printf ...)"`, for the same reason
+  # _json_section_chats' own row-build loop uses `-v`: capturing printf's own
+  # stdout back into a variable forks a subshell per row for nothing.
+  local final="" f
+  for f in "${stage[@]+"${stage[@]}"}"; do
+    IFS=$'\x1f' read -r id ts sid title from to verb undoof redoof isundone dest_exists src_exists dest_path <<<"$f"
+    local dmt=""
+    [[ -n "$dest_path" ]] && dmt="${MTIME[$dest_path]:-}"
+    local _row
+    printf -v _row '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+      "$id" "$ts" "$sid" "$title" "$from" "$to" "$verb" "$undoof" "$redoof" "$isundone" \
+      "$dest_exists" "$src_exists" "$dmt"
+    final+="$_row"$'\n'
+  done
+
+  jq -Rn --argjson skipped "$(_json_skips_json)" --argjson errors "$errors_json" \
+        --argjson total "$total" --argjson limit "$limit" \
+    '[inputs | select(length>0) | split("\t") | {
+        id: .[0],
+        sid: (if .[2]=="-" then null else .[2] end),
+        title: (if .[3]=="-" then "" else .[3] end),
+        from: .[4], to: .[5], verb: .[6],
+        undoOf: (if .[7]=="-" then null else .[7] end),
+        redoOf: (if .[8]=="-" then null else .[8] end),
+        destExists: (.[10]=="true"),
+        sourceExists: (.[11]=="true"),
+        transferTs: (.[1]|tonumber),
+        destMtime: (if .[12]=="" then null else (.[12]|tonumber) end),
+        diverged: (.[10]=="true" and .[12]!="" and ((.[12]|tonumber) > ((.[1]|tonumber) + 2))),
+        undoable: (.[10]=="true" and .[9]!="1")
+      }] as $items
+    # "error", not "ok": a ledger that failed to PARSE is a check that could
+    # not run trustworthily, not a check that ran and happened to find
+    # nothing — the same distinction the "unavailable never renders like
+    # empty-ok" rule draws for schedules, one level up (section-wide instead
+    # of per-host).
+    | {status: (if ($errors|length) > 0 then "error" else "ok" end),
+       checksRun:["ledger","endpoints","divergence"], checksSkipped:$skipped,
+       errors:$errors, limit:$limit, total:$total, truncated:(($items|length) < $total), items:$items}' \
+    <<<"$final"
+}
+
+# ---- schedules section --------------------------------------------------------
+# systemd is the only backend today (launchd is a separate spec), so a host
+# without a working `systemctl --user` cannot answer the question at all. That
+# is `unavailable` with a reason — deliberately NOT an empty list, which reads
+# as "no schedules" and is the exact failure mode the "unavailable must never
+# render like empty-ok" rule forbids.
+#
+# Entrypoint dependencies read at call time only: SCHED_DIR, _compat_os.
+_systemd_available() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl --user list-timers >/dev/null 2>&1
+}
+
+# One pass over $SCHED_DIR/*/meta (each meta sourced the same way
+# cmd_schedule_ls already does — every consumed name re-declared `local`
+# immediately before the source, so a field ONE schedule's meta omits can
+# never leak the PREVIOUS schedule's value into its row), plus at most two
+# batched `systemctl --user` calls for the whole section — never one per
+# schedule:
+#   - `list-timers --output=json` for nextFire/lastFire. Verified against a
+#     real systemd (255): with JSON output the NEXT/LAST columns are raw usec
+#     integers, not the locale-formatted date strings the plain-text table
+#     renders — exactly the unambiguous instant this field needs to be, with
+#     no date-parsing fork required at all.
+#   - `show 'claude-schedule-*.timer' -p Id -p ActiveState` for unitState,
+#     accepting the glob the same way `list-timers 'claude-schedule-*'`
+#     already does elsewhere in this file's sibling module.
+# Both are skipped entirely when there are no schedules to join them against.
+#
+# nextFire/lastFire are tri-state on purpose: a timer systemd does not list
+# (or lists with no recorded last-trigger yet) yields {value:null,
+# state:"unknown"} — never epoch 0, which would read as a real instant instead
+# of "never observed".
+#
+# whenTz/tzSource/tzVerified and drift are honest unknowns in this build: the
+# zone this schedule's clock time is anchored to, and what it would even mean
+# to drift, are both later tasks (12 and 14 respectively). `pings` — how many
+# times this schedule has actually fired — is the same kind of unknown: there
+# is no counter for it yet (systemd's own timer state doesn't carry one, and
+# computing it would mean a journalctl read this build does not do), so it is
+# reported as null rather than guessed at or silently omitted.
+_json_section_schedules() {
+  _json_skip_reset
+  if ! _systemd_available; then
+    jq -n --arg p "$(_compat_os)" \
+      '{status:"unavailable",
+        reason:"systemctl --user is not available on this host, so schedules cannot be read",
+        platform:$p, checksRun:[], checksSkipped:[], errors:[], items:[]}'
+    return 0
+  fi
+
+  local rows="" d sid_dir
+  shopt -s nullglob
+  for sid_dir in "$SCHED_DIR"/*/; do
+    [[ -f "$sid_dir/meta" ]] || continue
+    d="$(basename "$sid_dir")"
+    local target="" sid="" account="" mode="" model="" keepalive="" cwd="" timeout="" \
+          when_kind="" when_val="" first="" created="" done=""
+    # shellcheck disable=SC1091
+    . "$sid_dir/meta" 2>/dev/null || true
+    # Neutralize tab/newline defensively (meta values normally round-trip
+    # through `printf %q`, but a hand-edited meta could still smuggle one in),
+    # AND map a genuinely empty value to "-" — sid is legitimately empty for
+    # target=="new" (no chat to name yet), and a hand-pruned or partially
+    # written meta could leave any other field blank too. Every one of these
+    # sits mid-row, so a bare empty value is the exact "tab is IFS whitespace"
+    # hazard the ledger section above ran into: the run of two adjacent tabs
+    # an empty field produces collapses into ONE delimiter under `read`,
+    # shifting every field after it one slot left. "-" is the same non-empty
+    # sentinel _session_rows already uses for this, decoded back to
+    # null/empty in the closing jq below.
+    local acct2="${account//$'\t'/ }"; acct2="${acct2//$'\n'/ }"; [[ -z "$acct2" ]] && acct2="-"
+    local tgt2="${target//$'\t'/ }"; tgt2="${tgt2//$'\n'/ }"; [[ -z "$tgt2" ]] && tgt2="-"
+    local sid2="${sid//$'\t'/ }"; sid2="${sid2//$'\n'/ }"; [[ -z "$sid2" ]] && sid2="-"
+    local wk2="${when_kind//$'\t'/ }"; wk2="${wk2//$'\n'/ }"; [[ -z "$wk2" ]] && wk2="-"
+    local wv2="${when_val//$'\t'/ }"; wv2="${wv2//$'\n'/ }"; [[ -z "$wv2" ]] && wv2="-"
+    local md2="${mode//$'\t'/ }"; md2="${md2//$'\n'/ }"; [[ -z "$md2" ]] && md2="-"
+    local cw2="${cwd//$'\t'/ }"; cw2="${cw2//$'\n'/ }"; [[ -z "$cw2" ]] && cw2="-"
+    local to2="${timeout//$'\t'/ }"; to2="${to2//$'\n'/ }"; [[ -z "$to2" ]] && to2="-"
+    local ka2="false"; [[ "${keepalive:-0}" == 1 ]] && ka2="true"
+    local _row
+    printf -v _row '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+      "$d" "$acct2" "$tgt2" "$sid2" "$wk2" "$wv2" "$ka2" "$md2" "$cw2" "$to2" "${created:-}"
+    rows+="$_row"$'\n'
+  done
+
+  local timers_raw="[]" states_raw=""
+  if [[ -n "$rows" ]]; then
+    timers_raw="$(systemctl --user list-timers --output=json --no-pager 2>/dev/null)"
+    if [[ "$timers_raw" != \[* ]]; then
+      _json_skip "timers" "systemctl --user list-timers --output=json produced no usable data on this host — nextFire/lastFire are reported as unknown"
+      timers_raw="[]"
+    fi
+    states_raw="$(systemctl --user show 'claude-schedule-*.timer' -p Id -p ActiveState --no-pager 2>/dev/null)"
+  else
+    _json_skip "timers" "no schedules to join fire times against"
+  fi
+
+  jq -Rn --argjson skipped "$(_json_skips_json)" --argjson timers "$timers_raw" --arg states "$states_raw" '
+    ($timers | if type=="array" then . else [] end
+      | map(select(.unit? and (.unit|test("^claude-schedule-.*\\.timer$"))))
+      | map({key: (.unit | sub("^claude-schedule-";"") | sub("\\.timer$";"")),
+             value: {next: (.next // null), last: (.last // null)}})
+      | from_entries) as $fire
+    | ($states
+        | split("\n\n")
+        | map(select(length>0))
+        | map( split("\n") | map(select(length>0) | split("="))
+               | map({(.[0]): (.[1:] | join("="))}) | add )
+        | map(select(.Id != null))
+        | map({key: (.Id | sub("^claude-schedule-";"") | sub("\\.timer$";"")), value: .ActiveState})
+        | from_entries) as $states_by_id
+    # "-" decodes to null for every meta-sourced field here, not just sid: a
+    # well-formed schedule always has account/target/whenKind/whenVal/mode/
+    # cwd/timeout populated, so "-" only ever shows up for a hand-edited or
+    # partially-written meta — and null is the honest way to report that,
+    # not the bash-internal placeholder itself.
+    | [inputs | select(length>0) | split("\t") | . as $f | {
+        id: $f[0],
+        account: (if $f[1]=="-" then null else $f[1] end),
+        target: (if $f[2]=="-" then null else $f[2] end),
+        sid: (if $f[3]=="-" then null else $f[3] end),
+        whenKind: (if $f[4]=="-" then null else $f[4] end),
+        whenVal: (if $f[5]=="-" then null else $f[5] end),
+        whenTz: null, tzSource: "none", tzVerified: false,
+        pings: null,
+        keepalive: ($f[6]=="true"),
+        mode: (if $f[7]=="-" then null else $f[7] end),
+        cwd: (if $f[8]=="-" then null else $f[8] end),
+        timeout: (if $f[9]=="-" then null else $f[9] end),
+        created: (if $f[10]=="" then null else ($f[10]|tonumber) end),
+        nextFire: (
+          ($fire[$f[0]].next) as $n
+          | if ($n != null and $n > 0) then {value: ($n/1000000|floor), state:"known"}
+            else {value:null, state:"unknown"} end
+        ),
+        lastFire: (
+          ($fire[$f[0]].last) as $l
+          | if ($l != null and $l > 0) then {value: ($l/1000000|floor), state:"known"}
+            else {value:null, state:"unknown"} end
+        ),
+        unitState: ($states_by_id[$f[0]] // null),
+        drift: {state:"unknown",
+                reason:"work-window schedules and quota anchors are not in this build yet",
+                actualStart:null, evidence:null}
+      }] as $items
+    | {status:"ok", checksRun:["schedules","timers"], checksSkipped:$skipped, errors:[], items:$items}
+  ' <<<"$rows"
+}

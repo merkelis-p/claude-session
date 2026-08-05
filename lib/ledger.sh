@@ -239,6 +239,13 @@ _transfer_badge() {
 }
 
 cmd_transfer_log() {
+  # --json short-circuits before any flag is even used for filtering: it emits
+  # the same ledger section _snapshot's envelope would, verbatim, so the two
+  # can never disagree about what a transfer's state is. The --from/--to/
+  # --sid/--since/--limit filters below are a human-rendering convenience and
+  # are not honored in --json mode yet — a consumer that wants a subset
+  # filters the envelope's own ledger.items itself.
+  if (( JSON_OUT == 1 )); then _json_section_ledger; return 0; fi
   local f_from="" f_to="" f_sid="" f_since="" f_limit=0 a
   for a in "$@"; do case "$a" in
     --from=*) f_from="${a#*=}";; --to=*) f_to="${a#*=}";;
@@ -357,6 +364,17 @@ cmd_transfer_prune() {
 }
 
 cmd_transfer() {
+  # _JSON_READY_VERBS gates by verb ("transfer") as a whole; only `log` (via
+  # _json_section_ledger, called from cmd_transfer_log below) actually emits
+  # JSON. Without this subcommand-level check, `transfer undo --json` — or a
+  # bare `transfer <sid> --to=... --json` — would pass the top-level guard
+  # and then silently run its ordinary interactive path, discarding the
+  # --json request instead of erroring on it: the same failure mode
+  # cmd_accounts already guards against for `accounts add/rm --json`.
+  if (( JSON_OUT == 1 )) && [[ "${1:-}" != "log" ]]; then
+    echo "claude-session: --json is not available for 'transfer ${1:-}' in this build" >&2
+    exit 2
+  fi
   case "${1:-}" in
     log)   shift; cmd_transfer_log "$@"; return ;;
     undo)  shift; cmd_transfer_undo "$@"; return ;;

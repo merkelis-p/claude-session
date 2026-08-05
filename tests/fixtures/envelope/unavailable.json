@@ -1,0 +1,131 @@
+{
+  "core": {
+    "bash": "5.2.21(1)-release",
+    "elapsedMsPrecision": "ms",
+    "lib": "/home/u/.local/share/claude-helpers",
+    "platform": "linux",
+    "version": "0.2.0"
+  },
+  "elapsedMs": 175,
+  "generatedAt": 1785927058,
+  "schemaVersion": 1,
+  "sections": {
+    "accounts": {
+      "checksRun": [
+        "registry",
+        "credentials"
+      ],
+      "checksSkipped": [
+        {
+          "name": "quota-anchor",
+          "reason": "quota.conf support is not in this build yet"
+        }
+      ],
+      "errors": [],
+      "items": [
+        {
+          "credentials": false,
+          "description": "",
+          "dir": "/home/u/.claude",
+          "name": "default"
+        }
+      ],
+      "status": "ok"
+    },
+    "chats": {
+      "checksRun": [
+        "transcripts",
+        "runtime",
+        "provenance",
+        "titles-index"
+      ],
+      "checksSkipped": [],
+      "degraded": 0,
+      "errors": [],
+      "items": [],
+      "limit": 200,
+      "status": "ok",
+      "titlesIndex": {
+        "pending": 0,
+        "resolved": 0,
+        "state": "cold"
+      },
+      "total": 0,
+      "truncated": false
+    },
+    "issues": {
+      "checksRun": [
+        "same-chat-twice",
+        "rc-bridge-shared",
+        "duplicate-bridge",
+        "stalled",
+        "stale",
+        "title-index",
+        "upstream-field"
+      ],
+      "checksSkipped": [
+        {
+          "name": "same-chat-twice",
+          "reason": "no Claude session-state files to check"
+        },
+        {
+          "name": "rc-bridge-shared",
+          "reason": "no Claude session-state files to check"
+        },
+        {
+          "name": "duplicate-bridge",
+          "reason": "no Claude session-state files to check"
+        },
+        {
+          "name": "stalled",
+          "reason": "no Claude session-state files to check"
+        },
+        {
+          "name": "stale",
+          "reason": "no Claude session-state files to check"
+        }
+      ],
+      "errors": [],
+      "items": [],
+      "status": "ok"
+    },
+    "ledger": {
+      "checksRun": [
+        "ledger",
+        "endpoints",
+        "divergence"
+      ],
+      "checksSkipped": [
+        {
+          "name": "endpoints",
+          "reason": "no ledger file yet"
+        }
+      ],
+      "errors": [],
+      "items": [],
+      "limit": 0,
+      "status": "ok",
+      "total": 0,
+      "truncated": false
+    },
+    "processes": {
+      "checksRun": [
+        "orphan-process",
+        "stuck-build"
+      ],
+      "checksSkipped": [],
+      "errors": [],
+      "items": [],
+      "status": "ok"
+    },
+    "schedules": {
+      "checksRun": [],
+      "checksSkipped": [],
+      "errors": [],
+      "items": [],
+      "platform": "linux",
+      "reason": "systemctl --user is not available on this host, so schedules cannot be read",
+      "status": "unavailable"
+    }
+  }
+}

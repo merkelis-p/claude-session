@@ -1,0 +1,304 @@
+{
+  "core": {
+    "bash": "5.2.21(1)-release",
+    "elapsedMsPrecision": "ms",
+    "lib": "/home/u/.local/share/claude-helpers",
+    "platform": "linux",
+    "version": "0.2.0"
+  },
+  "elapsedMs": 259,
+  "generatedAt": 1785927057,
+  "schemaVersion": 1,
+  "sections": {
+    "accounts": {
+      "checksRun": [
+        "registry",
+        "credentials"
+      ],
+      "checksSkipped": [
+        {
+          "name": "quota-anchor",
+          "reason": "quota.conf support is not in this build yet"
+        }
+      ],
+      "errors": [],
+      "items": [
+        {
+          "credentials": false,
+          "description": "",
+          "dir": "/home/u/.claude",
+          "name": "default"
+        },
+        {
+          "credentials": true,
+          "description": "second account",
+          "dir": "/home/u/.claude-alpha",
+          "name": "alpha"
+        }
+      ],
+      "status": "ok"
+    },
+    "chats": {
+      "checksRun": [
+        "transcripts",
+        "runtime",
+        "provenance",
+        "titles-index"
+      ],
+      "checksSkipped": [
+        {
+          "name": "titles-window",
+          "reason": "4 title(s) are not in the index — fetch them with: claude-session _titles --json --sids=<csv>"
+        }
+      ],
+      "degraded": 0,
+      "errors": [],
+      "items": [
+        {
+          "account": "default",
+          "accountDir": "/home/u/.claude",
+          "cwd": "/home/u/proj1",
+          "degraded": false,
+          "degradedReason": null,
+          "flags": [],
+          "mtime": 1785927057,
+          "provenance": null,
+          "runtime": {
+            "alive": true,
+            "attachable": false,
+            "bridgeSessionId": null,
+            "entrypoint": "claude",
+            "pid": 742129,
+            "present": true,
+            "rss": {
+              "state": "known",
+              "value": 2
+            },
+            "status": "idle",
+            "statusAgeSec": null,
+            "tmux": "(detached)"
+          },
+          "sessionId": "sid-full-1",
+          "title": {
+            "source": "none",
+            "state": "unknown",
+            "value": ""
+          },
+          "transcriptPath": "/home/u/.claude/projects/-home-u-proj1/sid-full-1.jsonl",
+          "transcriptPathSource": "sid-match"
+        },
+        {
+          "account": "default",
+          "accountDir": "/home/u/.claude",
+          "cwd": null,
+          "degraded": false,
+          "degradedReason": null,
+          "flags": [],
+          "mtime": 1785927057,
+          "provenance": null,
+          "runtime": {
+            "alive": null,
+            "attachable": false,
+            "bridgeSessionId": null,
+            "entrypoint": null,
+            "pid": null,
+            "present": false,
+            "rss": {
+              "state": "unknown",
+              "value": null
+            },
+            "status": null,
+            "statusAgeSec": null,
+            "tmux": null
+          },
+          "sessionId": "sid-full-3",
+          "title": {
+            "source": "none",
+            "state": "unknown",
+            "value": ""
+          },
+          "transcriptPath": "/home/u/.claude/projects/-home-u-proj3/sid-full-3.jsonl",
+          "transcriptPathSource": "sid-match"
+        },
+        {
+          "account": "alpha",
+          "accountDir": "/home/u/.claude-alpha",
+          "cwd": null,
+          "degraded": false,
+          "degradedReason": null,
+          "flags": [],
+          "mtime": 1785927057,
+          "provenance": {
+            "from": "default",
+            "kind": "transfer",
+            "ts": 1785919857
+          },
+          "runtime": {
+            "alive": null,
+            "attachable": false,
+            "bridgeSessionId": null,
+            "entrypoint": null,
+            "pid": null,
+            "present": false,
+            "rss": {
+              "state": "unknown",
+              "value": null
+            },
+            "status": null,
+            "statusAgeSec": null,
+            "tmux": null
+          },
+          "sessionId": "sid-full-4",
+          "title": {
+            "source": "none",
+            "state": "unknown",
+            "value": ""
+          },
+          "transcriptPath": "/home/u/.claude-alpha/projects/-home-u-proj4/sid-full-4.jsonl",
+          "transcriptPathSource": "sid-match"
+        },
+        {
+          "account": "alpha",
+          "accountDir": "/home/u/.claude-alpha",
+          "cwd": "/home/u/proj2",
+          "degraded": false,
+          "degradedReason": null,
+          "flags": [],
+          "mtime": 1785927057,
+          "provenance": null,
+          "runtime": {
+            "alive": true,
+            "attachable": false,
+            "bridgeSessionId": null,
+            "entrypoint": "claude",
+            "pid": 742133,
+            "present": true,
+            "rss": {
+              "state": "known",
+              "value": 2
+            },
+            "status": "idle",
+            "statusAgeSec": null,
+            "tmux": "(detached)"
+          },
+          "sessionId": "sid-full-2",
+          "title": {
+            "source": "none",
+            "state": "unknown",
+            "value": ""
+          },
+          "transcriptPath": "/home/u/.claude-alpha/projects/-home-u-proj2/sid-full-2.jsonl",
+          "transcriptPathSource": "sid-match"
+        }
+      ],
+      "limit": 200,
+      "status": "ok",
+      "titlesIndex": {
+        "pending": 4,
+        "resolved": 0,
+        "state": "cold"
+      },
+      "total": 4,
+      "truncated": false
+    },
+    "issues": {
+      "checksRun": [
+        "same-chat-twice",
+        "rc-bridge-shared",
+        "duplicate-bridge",
+        "stalled",
+        "stale",
+        "title-index",
+        "upstream-field"
+      ],
+      "checksSkipped": [],
+      "errors": [],
+      "items": [],
+      "status": "ok"
+    },
+    "ledger": {
+      "checksRun": [
+        "ledger",
+        "endpoints",
+        "divergence"
+      ],
+      "checksSkipped": [],
+      "errors": [],
+      "items": [
+        {
+          "destExists": true,
+          "destMtime": 1785927057,
+          "diverged": true,
+          "from": "default",
+          "id": "f19a2b",
+          "redoOf": null,
+          "sid": "sid-full-4",
+          "sourceExists": false,
+          "title": "Draft the migration guide",
+          "to": "alpha",
+          "transferTs": 1785919857,
+          "undoOf": null,
+          "undoable": true,
+          "verb": "move"
+        }
+      ],
+      "limit": 50,
+      "status": "ok",
+      "total": 1,
+      "truncated": false
+    },
+    "processes": {
+      "checksRun": [
+        "orphan-process",
+        "stuck-build"
+      ],
+      "checksSkipped": [],
+      "errors": [],
+      "items": [],
+      "status": "ok"
+    },
+    "schedules": {
+      "checksRun": [
+        "schedules",
+        "timers"
+      ],
+      "checksSkipped": [],
+      "errors": [],
+      "items": [
+        {
+          "account": "alpha",
+          "created": 1785923457,
+          "cwd": "/home/u/proj2",
+          "drift": {
+            "actualStart": null,
+            "evidence": null,
+            "reason": "work-window schedules and quota anchors are not in this build yet",
+            "state": "unknown"
+          },
+          "id": "9c41af",
+          "keepalive": false,
+          "lastFire": {
+            "state": "known",
+            "value": 1785923457
+          },
+          "mode": "autopilot",
+          "nextFire": {
+            "state": "known",
+            "value": 1785927357
+          },
+          "pings": null,
+          "sid": "sid-full-2",
+          "target": "chat",
+          "timeout": "30m",
+          "tzSource": "none",
+          "tzVerified": false,
+          "unitState": "active",
+          "whenKind": "every",
+          "whenTz": null,
+          "whenVal": "5h"
+        }
+      ],
+      "status": "ok"
+    }
+  }
+}

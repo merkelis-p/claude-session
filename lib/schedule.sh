@@ -167,6 +167,9 @@ cmd_schedule_run_now() {
 }
 
 cmd_schedule_ls() {
+  # --json short-circuits before any human rendering: it emits the same
+  # schedules section _snapshot's envelope would, verbatim.
+  if (( JSON_OUT == 1 )); then _json_section_schedules; return 0; fi
   box_top "Scheduled prompts"
   shopt -s nullglob
   local any=0 d id
@@ -245,6 +248,17 @@ cmd_schedule_keepalive() {
 
 cmd_schedule() {
   local sub="${1:-ls}"; shift || true
+  # _JSON_READY_VERBS gates by verb ("schedule") as a whole; only `ls` (via
+  # _json_section_schedules, called from cmd_schedule_ls above) actually
+  # emits JSON. Without this subcommand-level check, `schedule add --json`
+  # would pass the top-level guard and then silently run its ordinary
+  # interactive path — the same failure mode cmd_accounts already guards
+  # against for `accounts add/rm --json`, and cmd_transfer now guards for
+  # every `transfer` subcommand but `log`.
+  if (( JSON_OUT == 1 )) && [[ "$sub" != "ls" ]]; then
+    echo "claude-session: --json is not available for 'schedule $sub' in this build" >&2
+    exit 2
+  fi
   case "$sub" in
     add)       cmd_schedule_add "$*" ;;
     ls)        cmd_schedule_ls ;;

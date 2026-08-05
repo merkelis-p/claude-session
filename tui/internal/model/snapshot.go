@@ -186,24 +186,29 @@ type Chat struct {
 	DegradedReason       string      `json:"degradedReason"`
 }
 
-// Runtime is a chat's live-process view. Present, PID and Alive are plain
-// types (not Field[T]) because CriticalMissing needs to reason about them
-// structurally — Present gates whether PID/Alive are even expected to be
-// resolved at all (a transcript-only chat has no runtime by design, and
-// that absence is not degradation). StatusAgeSec and RSS stay Field[int]
-// because they are informational either way: absent this poll is never
-// worse than "unknown," never rendered as a bare 0.
+// Runtime is a chat's live-process view. Present and PID are plain types
+// because Present gates whether the rest is even expected to resolve (a
+// transcript-only chat has no runtime by design, and that absence is not
+// degradation). Alive is Field[bool], NOT a plain bool: the bash side emits
+// it as bare `true`/`false`/`null`, and those are three different facts —
+// alive, KNOWN-dead (a stale session file whose pid is gone: a real, non-
+// degraded state bash reports as `false`), and unresolved (`null`). A plain
+// bool collapses known-dead and unresolved into the same Go zero, which made
+// CriticalMissing flag every dead session as "missing runtime.alive" while
+// bash considered it fine — a cross-language disagreement about what counts
+// as degraded. StatusAgeSec and RSS stay Field[int] for the same reason:
+// absent this poll must never render as a bare 0.
 type Runtime struct {
-	Present         bool       `json:"present"`
-	PID             int        `json:"pid"`
-	Tmux            string     `json:"tmux"`
-	Attachable      bool       `json:"attachable"`
-	Entrypoint      string     `json:"entrypoint"`
-	Status          string     `json:"status"`
-	StatusAgeSec    Field[int] `json:"statusAgeSec"`
-	RSS             Field[int] `json:"rss"`
-	BridgeSessionID string     `json:"bridgeSessionId"`
-	Alive           bool       `json:"alive"`
+	Present         bool        `json:"present"`
+	PID             int         `json:"pid"`
+	Tmux            string      `json:"tmux"`
+	Attachable      bool        `json:"attachable"`
+	Entrypoint      string      `json:"entrypoint"`
+	Status          string      `json:"status"`
+	StatusAgeSec    Field[int]  `json:"statusAgeSec"`
+	RSS             Field[int]  `json:"rss"`
+	BridgeSessionID string      `json:"bridgeSessionId"`
+	Alive           Field[bool] `json:"alive"`
 }
 
 // UnmarshalJSON pre-seeds StatusAgeSec/RSS as NotRun before delegating to
@@ -221,6 +226,7 @@ func (r *Runtime) UnmarshalJSON(b []byte) error {
 	a := alias{
 		StatusAgeSec: Field[int]{State: NotRun},
 		RSS:          Field[int]{State: NotRun},
+		Alive:        Field[bool]{State: NotRun},
 	}
 	if err := unmarshalOrWrap(b, &a); err != nil {
 		return err

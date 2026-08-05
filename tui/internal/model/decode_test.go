@@ -254,6 +254,49 @@ func TestCriticalMissingReportsNoneOnAHealthyRow(t *testing.T) {
 	}
 }
 
+// runtime.alive is three-valued on the wire, and the three mean different
+// things for degradation — this is the case a plain `bool` got wrong.
+//   - alive:true  → healthy, not flagged
+//   - alive:false → a KNOWN-dead process (stale session file, pid gone). Bash
+//     reports this as degraded:false; Go must agree and NOT flag
+//     runtime.alive, or every dead session reads as "missing data."
+//   - alive:null  → unresolved; a present runtime whose aliveness the poll did
+//     not establish IS degraded, and must be flagged.
+func TestCriticalMissingAliveKnownFalseIsNotMissing(t *testing.T) {
+	mk := func(aliveJSON string) Chat {
+		doc := `{"schemaVersion":1,"generatedAt":1,"elapsedMs":1,
+			"core":{"version":"0.2.0","platform":"linux","bash":"5","lib":"/home/u/.local/share/claude-helpers","elapsedMsPrecision":"ms"},
+			"sections":{"chats":{"status":"ok","checksRun":[],"checksSkipped":[],"errors":[],"limit":200,"total":1,"truncated":false,"degraded":0,
+			"items":[{"sessionId":"sid-1","account":"default","accountDir":"/home/u/.claude",
+			"transcriptPath":"/home/u/.claude/projects/-home-u-p/sid-1.jsonl","transcriptPathSource":"sid-match",
+			"title":{"value":"t","state":"known","source":"ai-title"},"cwd":null,"mtime":1,
+			"runtime":{"present":true,"pid":123,"tmux":"(detached)","attachable":false,"entrypoint":"claude","status":"idle","alive":` + aliveJSON + `},
+			"flags":[],"provenance":null,"degraded":false,"degradedReason":null}]}}}`
+		snap, err := Decode([]byte(doc))
+		if err != nil {
+			t.Fatalf("decode (alive=%s): %v", aliveJSON, err)
+		}
+		return snap.Sections.Chats.Items[0]
+	}
+	contains := func(xs []string, s string) bool {
+		for _, x := range xs {
+			if x == s {
+				return true
+			}
+		}
+		return false
+	}
+	if got := CriticalMissing(mk("false")); contains(got, "runtime.alive") {
+		t.Fatalf("a present, KNOWN-dead runtime (alive:false) was flagged runtime.alive: %v (bash reports it non-degraded)", got)
+	}
+	if got := CriticalMissing(mk("true")); contains(got, "runtime.alive") {
+		t.Fatalf("a present, alive runtime was flagged runtime.alive: %v", got)
+	}
+	if got := CriticalMissing(mk("null")); !contains(got, "runtime.alive") {
+		t.Fatalf("a present runtime with UNRESOLVED aliveness (alive:null) was NOT flagged: %v", got)
+	}
+}
+
 // The real partial.json fixture already carries a row bash itself flagged
 // as degraded (degradedReason "sessionId", exactly one field). Go's
 // CriticalMissing, computed independently from the typed fields, must

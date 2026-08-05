@@ -142,18 +142,15 @@ var criticalChecks = []struct {
 	// actually present: a transcript-only chat has no runtime by design,
 	// and that absence is not degradation (docs/json-schema.md, "chats").
 	{"runtime.pid", func(c Chat) bool { return c.Runtime.Present && c.Runtime.PID == 0 }},
-	// Runtime.Alive is a plain bool (not Field[bool]), so a resolved
-	// "false" and an unresolved value are the same Go zero value once the
-	// wire's `null` has been decoded — see Runtime's own doc comment. This
-	// check therefore also flags a present-but-not-alive row, trading an
-	// occasional false "degraded" on a row that is genuinely just dead for
-	// the alternative, which is silently accepting an unresolved critical
-	// field as if it had been verified — the failure mode this whole
-	// package exists to rule out. There is no real fixture of a present
-	// row with a legitimately-false, non-degraded alive today; if one
-	// shows up, Runtime.Alive needs to become Field[bool] to keep this
-	// exact.
-	{"runtime.alive", func(c Chat) bool { return c.Runtime.Present && !c.Runtime.Alive }},
+	// Alive is critical-missing only when a present runtime's aliveness was
+	// NOT resolved (state unknown/notRun — the wire sent `null` or omitted
+	// the key). A resolved `false` is a KNOWN-dead process (a stale session
+	// file whose pid is gone), which bash reports as non-degraded — so this
+	// must NOT flag it, or the TUI would badge every dead session as
+	// "missing data" while bash considers it fine. Field[bool] is what makes
+	// dead (Known false) and unresolved (Unknown) distinguishable here; a
+	// plain bool collapsed them and produced exactly that disagreement.
+	{"runtime.alive", func(c Chat) bool { return c.Runtime.Present && !c.Runtime.Alive.IsKnown() }},
 }
 
 // criticalFields is spec §6.7's critical list, in the order CriticalMissing

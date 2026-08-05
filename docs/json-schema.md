@@ -339,7 +339,36 @@ session files each, 2 transcripts each**, title index warm), measured
 | — ps forks | 1 |
 | `_snapshot --json` (all six sections) — ps forks | 1 |
 | `_titles --sids=<2 sids>` — jq forks | 1 |
-| **`_snapshot --only=chats,issues,accounts` p95** | **~245 ms** (within the 400 ms target) |
+| **`_snapshot --only=chats,issues,accounts` p95 (this fixture)** | **~245 ms** |
+
+**The fixture p95 is a FLOOR, not the number Task 18 should trust for a large
+account.** Measured on the development host (3 accounts, ~6,810 real
+transcripts, load ~1.0, 2026-08-05):
+
+| call | this host |
+|---|---|
+| `--only=accounts` | ~38 ms |
+| `--only=chats` | **~650 ms** |
+| `--only=issues` | ~265 ms |
+| `--only=chats,issues,accounts` | **~950–1150 ms** |
+| `--only=processes` / `ledger` / `schedules` | ~190 / ~60 / ~100 ms |
+
+`chats` dominates and scales with the account's **total** transcript count, not
+the window: its title *resolution* is windowed and index-backed (cost
+independent of transcript count — the flatness assertion in `tests/test_perf.sh`
+proves that part), but its *enumeration* — `_build_transfer_index` globbing,
+`stat`-ing and sorting every transcript in every account to find the newest
+`--limit-chats` — is irreducibly O(total) as long as "newest N by mtime" is
+answered from the filesystem. The per-transcript bash-loop overhead was removed
+(≈700 ms → ≈113 ms per 2,200 files), but the `stat`+`sort` floor over thousands
+of files remains.
+
+**Consequence for Task 18: on an account of this size the poll misses the 400 ms
+target, so the cadence is 5 s, not 2 s — by design, not by waiver.** Getting to
+2 s at this scale needs the chats enumeration to source "newest N" from the
+title index (which already holds every seen transcript's mtime) instead of the
+filesystem — a deliberate freshness trade (a brand-new chat would appear only
+once indexed) that is its own decision, not this task's.
 
 The jq count is **fixed per-poll overhead — not per row.** It is one batched
 session-read per account-with-sessions, one main `jq` per emitted section, one

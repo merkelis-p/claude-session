@@ -161,11 +161,25 @@ assert_eq "$(jq -r '.sections.processes.items[0].pid|type' <<<"$pdoc")" "number"
 assert_eq "$(jq -r '.items[]|select(.sessionId=="sid-live").runtime.pid|type' <<<"$ch")" "number" \
   "chats.runtime.pid is a number" || fail=1
 
-# The upstream-field check: an unknown field in a session file is reported, not ignored.
-jq '. + {brandNewUpstreamField: 1}' "$HOME/.claude/sessions/$pid.json" > "$HOME/.claude/sessions/$pid.json.t" \
+# The upstream-field check: a GENUINELY unknown field is reported, but an
+# acknowledged benign one (real upstream growth the tool has seen and does not
+# need) is NOT — otherwise the check nags forever and inflates doctor's exit
+# code. Add one of each in the same file, so the same run proves both halves.
+jq '. + {brandNewUpstreamField: 1, peerProtocol: "x", version: 2}' \
+  "$HOME/.claude/sessions/$pid.json" > "$HOME/.claude/sessions/$pid.json.t" \
   && mv "$HOME/.claude/sessions/$pid.json.t" "$HOME/.claude/sessions/$pid.json"
-assert_contains "$("$CS" doctor 2>&1)" "brandNewUpstreamField" \
-  "doctor reports an unknown upstream session-state field" || fail=1
+upstream_out="$("$CS" doctor 2>&1)"
+assert_contains "$upstream_out" "brandNewUpstreamField" \
+  "doctor reports a genuinely unknown upstream session-state field" || fail=1
+assert_not_contains "$upstream_out" "peerProtocol" \
+  "an acknowledged benign field does not flag (it would nag forever otherwise)" || fail=1
+assert_not_contains "$upstream_out" "'version'" \
+  "and neither does another benign field" || fail=1
+# The per-host extension point: CS_DOCTOR_BENIGN_FIELDS silences a site-specific
+# field without editing the shipped allowlist.
+env_out="$(CS_DOCTOR_BENIGN_FIELDS="brandNewUpstreamField" "$CS" doctor 2>&1)"
+assert_not_contains "$env_out" "brandNewUpstreamField" \
+  "CS_DOCTOR_BENIGN_FIELDS silences a host-specific field" || fail=1
 
 # ---- the poll cost must scale with the WINDOW, not the account -------------
 # The whole windowed/indexed design exists so a poll on an account with

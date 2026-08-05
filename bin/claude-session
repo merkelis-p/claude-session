@@ -852,6 +852,19 @@ _doctor_warnings() {
 # test_ls_doctor_multiaccount.sh and test_doctor_orphans.sh. Only the
 # unknown-field direction (real, unambiguous schema growth) is implemented.
 _DOCTOR_KNOWN_SESSION_FIELDS="pid cwd entrypoint status waitingFor sessionId bridgeSessionId statusUpdatedAt updatedAt startedAt"
+# Fields the tool does NOT parse but has SEEN and deemed benign — real upstream
+# schema growth that carries nothing the tool needs, so flagging it on every
+# `doctor` run is noise, not signal. It also inflates doctor's issue count and
+# its exit status (which a monitoring loop keys on), so an unacknowledged-forever
+# warning is worse than useless. Same discipline as CI's macOS skip allowlist: a
+# field lands here only once a human has confirmed the tool losing it changes
+# nothing. A field in NEITHER list still flags — genuine drift the tool may be
+# silently missing data from is exactly what the check exists to surface.
+#
+# These accompany current Claude Code / launcher session state (naming, a format
+# version, process-start and peer/job bookkeeping). Per-host additions extend
+# this without editing the file, via CS_DOCTOR_BENIGN_FIELDS (space-separated).
+_DOCTOR_BENIGN_SESSION_FIELDS="version procStart kind name nameSource peerProtocol jobId parkedJobId"
 _doctor_upstream_fields() {
   shopt -s nullglob
   local -a files=()
@@ -870,7 +883,7 @@ _doctor_upstream_fields() {
   local k
   while IFS= read -r k; do
     [[ -z "$k" ]] && continue
-    case " $_DOCTOR_KNOWN_SESSION_FIELDS " in
+    case " $_DOCTOR_KNOWN_SESSION_FIELDS $_DOCTOR_BENIGN_SESSION_FIELDS ${CS_DOCTOR_BENIGN_FIELDS:-} " in
       *" $k "*) continue ;;
     esac
     printf "%b unknown session-state field '%s' (upstream schema changed — claude-session may be missing data)\n" \

@@ -94,6 +94,40 @@ truncate_str() {
   fi
 }
 
+
+# _ot_load: the real lib/ui.sh builds _OT_PANE2SESS/_OT_PID2PPID here (one
+# `tmux list-panes` + one `ps` per process, memoized via _OT_LOADED — see
+# that file's own comment). bin/claude-session's _session_rows calls
+# _ot_load directly, unconditionally, BEFORE it ever calls owner_tmux (to
+# populate the cache in the caller's own shell, not a subshell — see
+# _session_rows' comment on why) — so _ot_load has to exist here too, not
+# just owner_tmux, or every --json path through _session_rows dies with
+# "_ot_load: command not found" on stderr while stdout still emits a
+# document, which content-only assertions never notice (this harness's own
+# top-of-file warning, applied to itself).
+#
+# Deliberately a memoization-guard-only no-op, not a real port: shelling out
+# to the actual host `tmux`/`ps` here would make THIS stub's owner_tmux
+# resolution depend on real host tmux state — exactly what
+# tests/test_scan_fork_budget.sh's own setup comment says "every other test
+# in the suite" deliberately does NOT want (deterministic output, zero
+# dependency on whatever tmux sessions happen to exist on whatever host runs
+# this suite). That test is the one place the real behavior is actually
+# wanted, and it already gets there on its own — it appends the genuine
+# _ot_load/owner_tmux block from the shipped ui.sh on top of this stub
+# (function redefinition wins), specifically because a no-op here would
+# make its own fork-count assertions pass vacuously. A partial real
+# implementation shared by every OTHER test would only add non-determinism
+# for tests that never asked for it, so the guard-only form is the honest
+# choice, not a shortcut.
+_OT_LOADED=0
+declare -A _OT_PANE2SESS=()
+declare -A _OT_PID2PPID=()
+_ot_load() {
+  (( _OT_LOADED )) && return 0
+  _OT_LOADED=1
+}
+
 owner_tmux() { return 1; }
 ms_relative() { echo "0s"; }
 UI_STUB

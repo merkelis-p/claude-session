@@ -158,4 +158,94 @@ if [[ -f "$gosrc" ]]; then
 else
   echo "SKIP: bash<->Go schema-version cross-check — tui/cmd/claude-session-tui/main.go does not exist yet"
 fi
+
+# --- ledger: each entry joined against the CURRENT state of both endpoints ---
+mkdir -p "$TEST_HOME/.config/claude-helpers"
+printf '%s\n' '{"id":"7c78ba","ts":1753567500,"sid":"sid-x","title":"A chat","from":"default","to":"alpha","verb":"move","undoOf":null,"redoOf":null}' \
+  > "$TEST_HOME/.config/claude-helpers/transfer-log.jsonl"
+fake_transcript "$TEST_HOME/.claude-alpha" "$TEST_HOME/api" "sid-x" '{"type":"ai-title","aiTitle":"A chat"}' >/dev/null
+led="$(env_json _snapshot --json --only=ledger | jq -c '.sections.ledger')"
+assert_eq "$(jq -r '.items|length' <<<"$led")" "1" "ledger emits the entry" || fail=1
+e="$(jq -c '.items[0]' <<<"$led")"
+assert_eq "$(jq -r '.id' <<<"$e")" "7c78ba" "ledger id" || fail=1
+assert_eq "$(jq -r '.verb' <<<"$e")" "move" "ledger verb" || fail=1
+assert_eq "$(jq -r '.destExists' <<<"$e")" "true" "destExists is joined from disk" || fail=1
+assert_eq "$(jq -r '.sourceExists' <<<"$e")" "false" "sourceExists is joined from disk" || fail=1
+jq -e '.undoable|type=="boolean"' >/dev/null <<<"$e" && echo "PASS: undoable is a boolean" \
+  || { echo "FAIL: undoable missing" >&2; fail=1; }
+jq -e 'has("diverged")' >/dev/null <<<"$e" && echo "PASS: diverged is reported per entry" \
+  || { echo "FAIL: diverged missing" >&2; fail=1; }
+assert_eq "$(jq -cS . <<<"$(env_json transfer log --json)")" "$(jq -cS . <<<"$led")" \
+  "transfer log --json is the ledger section verbatim" || fail=1
+
+# --- ledger: a missing ledger file is ok/empty with a named skip, not a pass
+# and not an error — the file was never written yet on a fresh box. ----------
+noledger="$(LEDGER_FILE="$TEST_HOME/.config/claude-helpers/no-such-ledger.jsonl" \
+  env_json _snapshot --json --only=ledger | jq -c '.sections.ledger')"
+assert_eq "$(jq -r '.status' <<<"$noledger")" "ok" "a missing ledger file is still ok" || fail=1
+assert_eq "$(jq -r '.items|length' <<<"$noledger")" "0" "a missing ledger file yields no items" || fail=1
+assert_contains "$(jq -r '.checksSkipped[].name' <<<"$noledger")" "endpoints" \
+  "a missing ledger file skips the endpoints check by name, not silently" || fail=1
+
+# --- ledger: --json for anything but `log` is a hard error, not a silently-
+# ignored flag — the same subcommand-level guard accounts add/rm already has.
+"$CS" transfer undo --json >/dev/null 2>&1; assert_eq "$?" "2" \
+  "transfer undo --json is a hard error, not a silently-ignored flag" || fail=1
+
+# --- schedules: unavailable is NOT empty-ok ---------------------------------
+mkdir -p "$TEST_HOME/nosystemd"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$TEST_HOME/nosystemd/systemctl"; chmod +x "$TEST_HOME/nosystemd/systemctl"
+un="$(PATH="$TEST_HOME/nosystemd:$PATH" env_json _snapshot --json --only=schedules | jq -c '.sections.schedules')"
+assert_eq "$(jq -r '.status' <<<"$un")" "unavailable" "no systemctl --user means unavailable" || fail=1
+assert_contains "$(jq -r '.reason' <<<"$un")" "systemctl" "the reason names what is missing" || fail=1
+assert_eq "$(jq -r '.items|length' <<<"$un")" "0" "unavailable carries no items" || fail=1
+install_fake_systemctl
+ok="$(env_json _snapshot --json --only=schedules | jq -c '.sections.schedules')"
+assert_eq "$(jq -r '.status' <<<"$ok")" "ok" "a working systemctl means ok" || fail=1
+assert_eq "$(jq -r '.items|length' <<<"$ok")" "0" "ok with no schedules is an empty item list" || fail=1
+[[ "$(jq -cS . <<<"$un")" != "$(jq -cS . <<<"$ok")" ]] \
+  && echo "PASS: unavailable and empty-ok are different documents" \
+  || { echo "FAIL: unavailable renders identically to empty-ok" >&2; fail=1; }
+assert_eq "$(jq -r 'has("reason")' <<<"$ok")" "false" "empty-ok carries no reason field" || fail=1
+
+# --- schedules: --json for anything but `ls` is a hard error ---------------
+"$CS" schedule add "hi" --json >/dev/null 2>&1; assert_eq "$?" "2" \
+  "schedule add --json is a hard error, not a silently-ignored flag" || fail=1
+
+# --- schedules: `schedule ls --json` is the schedules section verbatim ----
+pubsched="$(env_json schedule ls --json)"
+assert_eq "$(jq -cS . <<<"$pubsched")" "$(jq -cS . <<<"$ok")" \
+  "schedule ls --json is byte-identical to the envelope's schedules section" || fail=1
+
+# --- the checked-in fixture corpus stays in sync with the emitters, and is
+# scrubbed of anything that could identify the real machine it was captured
+# on. The PII guard is deliberately GENERIC — no literal username, company,
+# or account name from this maintainer's own box may ever appear in a public
+# repo's committed test, or the guard itself becomes the leak it exists to
+# prevent. It allows exactly one placeholder home, /home/u, and rejects every
+# other /home/<name> path, plus any string shaped like a real session UUID
+# (fixtures use plainly-synthetic ids like sid-full-1, never a genuine
+# 8-4-4-4-12 hex UUID, so this pattern can reject the SHAPE outright instead
+# of trying to guess "real" from "fake").
+for f in full empty unavailable partial; do
+  p="$(cd "$(dirname "$CS")/.." && pwd)/tests/fixtures/envelope/$f.json"
+  if [[ -f "$p" ]]; then
+    jq -e '.schemaVersion==1 and (.sections|type=="object")' >/dev/null < "$p" \
+      && echo "PASS: fixture $f.json matches the envelope contract" \
+      || { echo "FAIL: fixture $f.json does not match the envelope contract" >&2; fail=1; }
+    bad_home="$(grep -oE '/home/[a-zA-Z0-9_-]+' "$p" | grep -vx '/home/u' || true)"
+    bad_uuid="$(grep -oE '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' "$p" || true)"
+    if [[ -n "$bad_home" || -n "$bad_uuid" ]]; then
+      echo "FAIL: fixture $f.json contains a personal path or a real-looking session id" >&2
+      [[ -n "$bad_home" ]] && echo "  home path(s): $bad_home" >&2
+      [[ -n "$bad_uuid" ]] && echo "  uuid-shaped id(s): $bad_uuid" >&2
+      fail=1
+    else
+      echo "PASS: fixture $f.json is free of personal identifiers"
+    fi
+  else
+    echo "FAIL: missing fixture tests/fixtures/envelope/$f.json" >&2; fail=1
+  fi
+done
+
 exit "$fail"

@@ -1,0 +1,188 @@
+{
+  "core": {
+    "bash": "5.2.21(1)-release",
+    "elapsedMsPrecision": "ms",
+    "lib": "/home/u/.local/share/claude-helpers",
+    "platform": "linux",
+    "version": "0.2.0"
+  },
+  "elapsedMs": 199,
+  "generatedAt": 1785927058,
+  "schemaVersion": 1,
+  "sections": {
+    "accounts": {
+      "checksRun": [
+        "registry",
+        "credentials"
+      ],
+      "checksSkipped": [
+        {
+          "name": "quota-anchor",
+          "reason": "quota.conf support is not in this build yet"
+        }
+      ],
+      "errors": [],
+      "items": [
+        {
+          "credentials": false,
+          "description": "",
+          "dir": "/home/u/.claude",
+          "name": "default"
+        }
+      ],
+      "status": "ok"
+    },
+    "chats": {
+      "checksRun": [
+        "transcripts",
+        "runtime",
+        "provenance",
+        "titles-index"
+      ],
+      "checksSkipped": [
+        {
+          "name": "titles-window",
+          "reason": "2 title(s) are not in the index — fetch them with: claude-session _titles --json --sids=<csv>"
+        }
+      ],
+      "degraded": 1,
+      "errors": [],
+      "items": [
+        {
+          "account": "default",
+          "accountDir": "/home/u/.claude",
+          "cwd": null,
+          "degraded": false,
+          "degradedReason": null,
+          "flags": [],
+          "mtime": 1785927058,
+          "provenance": null,
+          "runtime": {
+            "alive": null,
+            "attachable": false,
+            "bridgeSessionId": null,
+            "entrypoint": null,
+            "pid": null,
+            "present": false,
+            "rss": {
+              "state": "unknown",
+              "value": null
+            },
+            "status": null,
+            "statusAgeSec": null,
+            "tmux": null
+          },
+          "sessionId": "sid-partial-1",
+          "title": {
+            "source": "none",
+            "state": "unknown",
+            "value": ""
+          },
+          "transcriptPath": "/home/u/.claude/projects/-home-u-proj1/sid-partial-1.jsonl",
+          "transcriptPathSource": "sid-match"
+        },
+        {
+          "account": "default",
+          "accountDir": "/home/u/.claude",
+          "cwd": "/home/u/proj1",
+          "degraded": true,
+          "degradedReason": "sessionId",
+          "flags": [],
+          "mtime": 1785927058,
+          "provenance": null,
+          "runtime": {
+            "alive": true,
+            "attachable": false,
+            "bridgeSessionId": null,
+            "entrypoint": "claude",
+            "pid": 742532,
+            "present": true,
+            "rss": {
+              "state": "known",
+              "value": 2
+            },
+            "status": "idle",
+            "statusAgeSec": null,
+            "tmux": "(detached)"
+          },
+          "sessionId": null,
+          "title": {
+            "source": "none",
+            "state": "unknown",
+            "value": ""
+          },
+          "transcriptPath": "/home/u/.claude/projects/-home-u-proj1/sid-partial-1.jsonl",
+          "transcriptPathSource": "cwd-fallback"
+        }
+      ],
+      "limit": 200,
+      "status": "partial",
+      "titlesIndex": {
+        "pending": 2,
+        "resolved": 0,
+        "state": "cold"
+      },
+      "total": 1,
+      "truncated": false
+    },
+    "issues": {
+      "checksRun": [
+        "same-chat-twice",
+        "rc-bridge-shared",
+        "duplicate-bridge",
+        "stalled",
+        "stale",
+        "title-index",
+        "upstream-field"
+      ],
+      "checksSkipped": [],
+      "errors": [],
+      "items": [],
+      "status": "ok"
+    },
+    "ledger": {
+      "checksRun": [
+        "ledger",
+        "endpoints",
+        "divergence"
+      ],
+      "checksSkipped": [
+        {
+          "name": "endpoints",
+          "reason": "no ledger file yet"
+        }
+      ],
+      "errors": [],
+      "items": [],
+      "limit": 0,
+      "status": "ok",
+      "total": 0,
+      "truncated": false
+    },
+    "processes": {
+      "checksRun": [
+        "orphan-process",
+        "stuck-build"
+      ],
+      "checksSkipped": [],
+      "errors": [],
+      "items": [],
+      "status": "ok"
+    },
+    "schedules": {
+      "checksRun": [
+        "schedules",
+        "timers"
+      ],
+      "checksSkipped": [
+        {
+          "name": "timers",
+          "reason": "no schedules to join fire times against"
+        }
+      ],
+      "errors": [],
+      "items": [],
+      "status": "ok"
+    }
+  }
+}

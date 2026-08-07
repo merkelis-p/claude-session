@@ -1,0 +1,12 @@
+theme=dark glyphs=unicode color=mono
+
+● live
+✕ stale
+○ warn
+✓ ok
+— n/a
+? unknown
+! not checked
+~ derived
+
+ > selected row 

@@ -1,0 +1,12 @@
+theme=light glyphs=unicode color=ansi256
+
+[38;5;28m● live[0m
+[38;5;124m✕ stale[0m
+[38;5;94m○ warn[0m
+[38;5;28m✓ ok[0m
+[38;5;66m— n/a[0m
+[38;5;66m? unknown[0m
+[38;5;59m! not checked[0m
+[38;5;25m~ derived[0m
+
+[7m > selected row [0m

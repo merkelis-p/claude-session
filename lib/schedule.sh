@@ -182,7 +182,17 @@ _sched_tz_validate() {
 # An HH:MM wall-clock time in a named zone, as an epoch INSTANT. Every
 # comparison in this codebase uses instants; comparing wall-clock strings
 # across zones is how the drift check would have become meaningless.
-_sched_local_epoch() { TZ="$1" _parse_datetime "$(TZ="$1" date +%Y-%m-%d) $2:00"; }
+#
+# $3 is an optional anchor DATE (YYYY-MM-DD); it defaults to today, which is
+# right for a recurring kind (daily-at/work-window fire on the next matching
+# day). For a `once` schedule it MUST be the schedule's own stored date: a
+# winter `once` re-zoned in summer has a different UTC offset than today, so
+# anchoring on today would disclose the wrong instant and the wrong delta in
+# the one plan whose entire purpose is to disclose the correct one.
+_sched_local_epoch() {
+  local day="${3:-$(TZ="$1" date +%Y-%m-%d)}"
+  TZ="$1" _parse_datetime "$day $2:00"
+}
 
 # Resolve the first-fire anchor from SCHED_AT (a HH:MM clock time — e.g. an
 # account's 5h-limit reset) or SCHED_IN (a systemd span like 3h) into an
@@ -266,8 +276,8 @@ cmd_schedule_add() {
   local id; id="$(_sched_new_id)"
   local d="$SCHED_DIR/$id"; mkdir -p "$d"
   printf '%s' "$prompt" > "$d/prompt.txt"
-  { printf 'target=%q\nsid=%q\naccount=%q\nmode=%q\nmodel=%q\nkeepalive=%q\ncwd=%q\ntimeout=%q\nwhen_kind=%q\nwhen_val=%q\nfirst=%q\ncreated=%q\n' \
-      "$target" "$sid" "$acct" "$mode" "$model" "$keepalive" "$cwd" "$timeout" "$SCHED_WHEN_KIND" "$SCHED_WHEN_VAL" "$first" "$(date +%s)"
+  { printf 'target=%q\nsid=%q\naccount=%q\nmode=%q\nmodel=%q\nkeepalive=%q\ncwd=%q\ntimeout=%q\nwhen_kind=%q\nwhen_val=%q\nwhen_days=%q\nfirst=%q\ncreated=%q\n' \
+      "$target" "$sid" "$acct" "$mode" "$model" "$keepalive" "$cwd" "$timeout" "$SCHED_WHEN_KIND" "$SCHED_WHEN_VAL" "${SCHED_DAYS:-}" "$first" "$(date +%s)"
     if [[ -n "$when_tz" ]]; then
       printf 'when_tz=%q\ntz_source=%q\ntz_verified=%q\n' "$when_tz" "$tz_source" "$tz_verified"
     fi
@@ -362,7 +372,7 @@ cmd_schedule_retime() {
   local d="$SCHED_DIR/$id"
   [[ -d "$d" && -f "$d/meta" ]] || { echo "schedule retime: unknown schedule '$id'" >&2; exit 1; }
   local target="" sid="" account="" mode="" cwd="" timeout="" when_kind="" when_val="" \
-        first="" model="" keepalive="" when_tz="" tz_source="" tz_verified=""
+        when_days="" first="" model="" keepalive="" when_tz="" tz_source="" tz_verified=""
   # shellcheck disable=SC1091
   . "$d/meta"
   case "$when_kind" in
@@ -379,7 +389,7 @@ cmd_schedule_retime() {
   local spec new_verified=0
   while IFS= read -r spec; do
     _sched_tz_validate "$new_tz" "$spec $new_tz" || exit 2
-  done < <(_sched_oncal_specs "$when_kind" "$when_val" "")
+  done < <(_sched_oncal_specs "$when_kind" "$when_val" "$when_days")
   new_verified="$SCHED_TZ_VERIFIED"
 
   local timer="$SYSTEMD_USER_DIR/claude-schedule-$id.timer"
@@ -393,12 +403,18 @@ cmd_schedule_retime() {
 
   # The headline instant: work-window has two OnCalendar lines, so the plan
   # names the START of the window (its "9am" is the one a human anchors on).
-  local hv="$when_val"
-  case "$when_kind" in work-window) hv="${when_val%-*}" ;; once) hv="${when_val#* }" ;; esac
+  local hv="$when_val" hday=""
+  case "$when_kind" in
+    work-window) hv="${when_val%-*}" ;;
+    # `once` is "<YYYY-MM-DD> <HH:MM>": the instant is on THAT date, not today,
+    # so the delta the plan discloses is only correct if both epochs anchor on
+    # the stored date (a winter once re-zoned in summer straddles a DST change).
+    once) hv="${when_val#* }"; hday="${when_val% *}" ;;
+  esac
 
   local cur_epoch new_epoch cur_utc="unknown" new_utc="unknown"
-  cur_epoch="$(_sched_local_epoch "$cur_tz" "$hv" 2>/dev/null)" || cur_epoch=""
-  new_epoch="$(_sched_local_epoch "$new_tz" "$hv" 2>/dev/null)" || new_epoch=""
+  cur_epoch="$(_sched_local_epoch "$cur_tz" "$hv" "$hday" 2>/dev/null)" || cur_epoch=""
+  new_epoch="$(_sched_local_epoch "$new_tz" "$hv" "$hday" 2>/dev/null)" || new_epoch=""
   [[ -n "$cur_epoch" ]] && cur_utc="$(TZ=UTC _epoch_to_human "$cur_epoch" '+%Y-%m-%d %H:%M')"
   [[ -n "$new_epoch" ]] && new_utc="$(TZ=UTC _epoch_to_human "$new_epoch" '+%Y-%m-%d %H:%M')"
 
@@ -429,7 +445,7 @@ cmd_schedule_retime() {
   local bak="$d/unit.bak.$(date +%s)"
   cp "$timer" "$bak" 2>/dev/null || true
 
-  _sched_write_units "$id" "$timeout" "$when_kind" "$when_val" "$first" "" "$new_tz"
+  _sched_write_units "$id" "$timeout" "$when_kind" "$when_val" "$first" "$when_days" "$new_tz"
   systemctl --user daemon-reload 2>/dev/null || true
   systemctl --user restart "claude-schedule-$id.timer" 2>/dev/null || true
 

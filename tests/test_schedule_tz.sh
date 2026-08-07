@@ -137,4 +137,35 @@ jq -e '.nextFire.state=="known" or .nextFire.state=="unknown"' >/dev/null <<<"$i
   && echo "PASS: nextFire stays a tri-state INSTANT, not a wall-clock string" || fail=1
 jq -e '(.nextFire.value|type)=="number" or (.nextFire.value==null)' >/dev/null <<<"$it" \
   && echo "PASS: nextFire.value is an epoch, so comparisons are zone-free" || fail=1
+
+# ===== retime moves ONLY the disclosed change: a --days filter must survive =====
+# doctor tells the user to run `schedule retime … --tz=` to fix a schedule
+# "without moving it" — so retime silently widening a weekday schedule to all
+# seven days would make following the tool's own advice a data-changing action.
+"$CS" schedule add "wk" --new --daily-at=09:00 --days=Mon..Fri --tz="$ZONE" --account=default >/dev/null 2>&1
+wkid="$(ls -t "$SCHED_DIR" | head -1)"
+wktimer="$SYSTEMD_USER_DIR/claude-schedule-$wkid.timer"
+assert_contains "$(cat "$SCHED_DIR/$wkid/meta")" "when_days=Mon..Fri" \
+  "the day-of-week filter is persisted to meta (or retime cannot preserve it)" || fail=1
+assert_contains "$(grep OnCalendar "$wktimer")" "Mon..Fri" "the unit starts with the weekday filter" || fail=1
+dd="$("$CS" schedule retime "$wkid" --tz=Europe/Berlin --json --dry-run 2>/dev/null | jq -r '.confirmations[0].digest')"
+"$CS" schedule retime "$wkid" --tz=Europe/Berlin --yes --ack="$dd" >/dev/null 2>&1
+assert_contains "$(grep OnCalendar "$wktimer")" "Mon..Fri" \
+  "retime preserves the weekday filter — it must not widen the schedule to all 7 days" || fail=1
+assert_contains "$(grep OnCalendar "$wktimer")" "Europe/Berlin" "and it did rezone" || fail=1
+
+# ===== retime discloses the CORRECT instant for a `once` across a DST boundary =====
+# _sched_local_epoch must anchor a `once` on ITS stored date, not today: a
+# winter once (Vilnius +2) re-zoned in summer (+3) would otherwise disclose the
+# wrong delta and date in the one plan whose whole job is disclosing them.
+"$CS" schedule add "wint" --new --once='2026-01-15 09:00' --tz="$ZONE" --account=default >/dev/null 2>&1
+wid="$(ls -t "$SCHED_DIR" | head -1)"
+wp="$("$CS" schedule retime "$wid" --tz=UTC --json --dry-run 2>/dev/null)"
+assert_contains "$(jq -r '.warnings|join(" ")' <<<"$wp")" "2026-01-15" \
+  "the once plan anchors on the schedule's stored date, not today" || fail=1
+# Vilnius 2026-01-15 09:00 = 07:00 UTC (January, +2); to UTC 09:00 is 2h later.
+# If it anchored on an August date it would compute +3 and disclose 3h — wrong.
+assert_contains "$(jq -r '.confirmations[0].text' <<<"$wp")" "2h0m" \
+  "the disclosed delta uses the stored date's real offset (2h in January), not today's" || fail=1
+
 exit "$fail"

@@ -1,0 +1,4 @@
+[
+  ["claude-session", "transfer", "dbb7ea9b-1111-2222-3333-444455556666", "--to=work", "--from=default", "--json", "--dry-run"],
+  ["claude-session", "transfer", "dbb7ea9b-1111-2222-3333-444455556666", "--to=work", "--from=default", "--json", "--yes", "--ack=a91f3c"]
+]

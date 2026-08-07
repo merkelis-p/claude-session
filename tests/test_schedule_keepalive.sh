@@ -92,4 +92,26 @@ secs_at="${first_at%s}"
 [[ "$secs_at" -gt 0 && "$secs_at" -le 86400 ]]; assert_eq "$?" "0" "SCHED_AT anchor falls within the next 24h" || fail=1
 SCHED_AT=""
 
+# ---- --work: a work-window keepalive instead of an interval one ----------
+# This is the feature the shipped defect (bare OnCalendar) actually mattered
+# for: a working day typed as 09:00-19:00 has to land at 09:00-19:00 in the
+# user's OWN day, never in whatever zone the host happens to be in. --work
+# requires an explicit zone (decision #2) — SCHED_TZ is set here exactly like
+# a real `--tz=` flag would set it.
+rm -rf "$SCHED_DIR"; mkdir -p "$SCHED_DIR"
+ZONE="Europe/Vilnius"
+SCHED_WORK="09:00-19:00" SCHED_TZ="$ZONE" ACCOUNT=zoned cmd_schedule_keepalive >/dev/null 2>&1
+id_work_zoned=""
+for d in "$SCHED_DIR"/*/; do id_work_zoned="$(basename "$d")"; done
+meta_wz="$(cat "$SCHED_DIR/$id_work_zoned/meta")"
+assert_contains "$meta_wz" "when_kind=work-window" "--work switches the keepalive to a work-window schedule" || fail=1
+assert_contains "$meta_wz" "when_val=09:00-19:00" "the window is recorded verbatim" || fail=1
+assert_contains "$meta_wz" "when_tz=$ZONE" "the resolved zone is recorded in meta" || fail=1
+assert_contains "$meta_wz" "tz_source=flag" "--tz was explicit, so the source is 'flag', not 'host'" || fail=1
+tmr_wz="$SYSTEMD_USER_DIR/claude-schedule-$id_work_zoned.timer"
+assert_contains "$(cat "$tmr_wz")" "OnCalendar=*-*-* 09:00:00 $ZONE" "the window's START is a zoned OnCalendar line" || fail=1
+assert_contains "$(cat "$tmr_wz")" "OnCalendar=*-*-* 19:00:00 $ZONE" "the window's END is ALSO a zoned OnCalendar line" || fail=1
+assert_eq "$(grep -c "$ZONE" "$tmr_wz")" "2" "both OnCalendar lines are zoned — this is the actual fix, not just one of them" || fail=1
+SCHED_WORK=""; SCHED_TZ=""
+
 exit "$fail"

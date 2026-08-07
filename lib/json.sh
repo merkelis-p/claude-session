@@ -1048,13 +1048,19 @@ _json_section_schedules() {
     return 0
   fi
 
+  # Resolved ONCE, not per row: a host's own timezone cannot change between
+  # iterations of this loop, and _host_timezone forks timedatectl/reads files —
+  # exactly the kind of per-row cost this module's fork-discipline rule (see
+  # file header) exists to avoid paying N times over.
+  local host_tz; host_tz="$(_host_timezone)"
+
   local rows="" d sid_dir
   shopt -s nullglob
   for sid_dir in "$SCHED_DIR"/*/; do
     [[ -f "$sid_dir/meta" ]] || continue
     d="$(basename "$sid_dir")"
     local target="" sid="" account="" mode="" model="" keepalive="" cwd="" timeout="" \
-          when_kind="" when_val="" first="" created="" done=""
+          when_kind="" when_val="" first="" created="" done="" when_tz="" tz_source="" tz_verified=""
     # shellcheck disable=SC1091
     . "$sid_dir/meta" 2>/dev/null || true
     # Neutralize tab/newline defensively (meta values normally round-trip
@@ -1077,9 +1083,27 @@ _json_section_schedules() {
     local cw2="${cwd//$'\t'/ }"; cw2="${cw2//$'\n'/ }"; [[ -z "$cw2" ]] && cw2="-"
     local to2="${timeout//$'\t'/ }"; to2="${to2//$'\n'/ }"; [[ -z "$to2" ]] && to2="-"
     local ka2="false"; [[ "${keepalive:-0}" == 1 ]] && ka2="true"
+    # Zone fields (this task): when_tz is only ever set for a wall-clock kind
+    # that has actually been resolved+validated (cmd_schedule_add/_sched_retime);
+    # its absence on a daily-at/once/work-window schedule means a legacy,
+    # never-zoned unit — tzSource "none" plus tzNote naming what it is ACTUALLY
+    # interpreted as (the host zone), so the app never has to guess or, worse,
+    # silently assume UTC. An `every` schedule genuinely has no zone concept
+    # (it is a duration, OnActiveSec/OnUnitActiveSec, not a calendar time) —
+    # same "none", but with no note, since there is nothing to interpret.
+    local wt2="${when_tz//$'\t'/ }"; wt2="${wt2//$'\n'/ }"; [[ -z "$wt2" ]] && wt2="-"
+    local ts2="${tz_source//$'\t'/ }"; ts2="${ts2//$'\n'/ }"; [[ -z "$ts2" ]] && ts2="none"
+    local tv2="false"; [[ "${tz_verified:-0}" == 1 ]] && tv2="true"
+    local tn2="-"
+    if [[ "$wt2" == "-" ]]; then
+      case "$wk2" in
+        daily-at|once|work-window) tn2="it fires in this host's $host_tz" ;;
+      esac
+    fi
     local _row
-    printf -v _row '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
-      "$d" "$acct2" "$tgt2" "$sid2" "$wk2" "$wv2" "$ka2" "$md2" "$cw2" "$to2" "${created:-}"
+    printf -v _row '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+      "$d" "$acct2" "$tgt2" "$sid2" "$wk2" "$wv2" "$ka2" "$md2" "$cw2" "$to2" "${created:-}" \
+      "$wt2" "$ts2" "$tv2" "$tn2"
     rows+="$_row"$'\n'
   done
 
@@ -1121,7 +1145,10 @@ _json_section_schedules() {
         sid: (if $f[3]=="-" then null else $f[3] end),
         whenKind: (if $f[4]=="-" then null else $f[4] end),
         whenVal: (if $f[5]=="-" then null else $f[5] end),
-        whenTz: null, tzSource: "none", tzVerified: false,
+        whenTz: (if $f[11]=="-" then null else $f[11] end),
+        tzSource: $f[12],
+        tzVerified: ($f[13]=="true"),
+        tzNote: (if $f[14]=="-" then null else $f[14] end),
         pings: null,
         keepalive: ($f[6]=="true"),
         mode: (if $f[7]=="-" then null else $f[7] end),
@@ -1140,7 +1167,7 @@ _json_section_schedules() {
         ),
         unitState: ($states_by_id[$f[0]] // null),
         drift: {state:"unknown",
-                reason:"work-window schedules and quota anchors are not in this build yet",
+                reason:"drift detection (actual ping activity vs. the intended schedule) and quota anchors are not in this build yet",
                 actualStart:null, evidence:null}
       }] as $items
     | {status:"ok", checksRun:["schedules","timers"], checksSkipped:$skipped, errors:[], items:$items}

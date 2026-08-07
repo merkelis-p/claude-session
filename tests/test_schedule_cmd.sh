@@ -24,6 +24,10 @@ assert_contains "$(cat "$SCHED_DIR/$id/meta")" "sid=sid-xyz" "meta records the t
 test -f "$SYSTEMD_USER_DIR/claude-schedule-$id.timer"; assert_eq "$?" "0" "timer unit written" || fail=1
 assert_contains "$(cat "$SYSTEMCTL_CALLS")" "daemon-reload" "add reloads systemd" || fail=1
 assert_contains "$(cat "$SYSTEMCTL_CALLS")" "enable --now claude-schedule-$id.timer" "add enables the timer" || fail=1
+# `every` is a duration (OnActiveSec/OnUnitActiveSec), not a calendar time — it
+# has no zone to resolve, and must not get one just because every OTHER
+# wall-clock kind now does.
+assert_not_contains "$(cat "$SCHED_DIR/$id/meta")" "when_tz=" "an every-schedule's meta carries no when_tz — it has no wall-clock time to zone" || fail=1
 
 # run (existing chat): claude --resume sid -p PROMPT --permission-mode acceptEdits, right cfg + cwd
 cmd_schedule_run "$id" >/dev/null 2>&1
@@ -45,6 +49,17 @@ assert_contains "$cc" "--permission-mode plan" "plan mode maps to plan" || fail=
 [[ "$cc" =~ --session-id\ [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12} ]]
 assert_eq "$?" "0" "new-chat run's session id is UUID-shaped" || fail=1
 
+# Shipped defect this task fixes: a daily-at add with no --tz used to write a
+# bare `OnCalendar=*-*-* 08:00:00` (read in whatever zone the SYSTEM happens to
+# be in). It now ALWAYS resolves a zone (falling back to the host as a last
+# resort — decision #2, the frozen contract keeps working unzoned) and writes
+# it explicitly into the unit and into meta, which is the actual fix.
+grep -qE '^OnCalendar=\*-\*-\* 08:00:00 [A-Za-z]+(/[A-Za-z_]+)?$' "$SYSTEMD_USER_DIR/claude-schedule-$id2.timer" \
+  && echo "PASS: a daily-at add with no --tz still writes an EXPLICIT zone into the unit (not bare digits)" \
+  || { echo "FAIL: daily-at wrote a bare OnCalendar with no zone" >&2; cat "$SYSTEMD_USER_DIR/claude-schedule-$id2.timer" >&2; fail=1; }
+assert_contains "$(cat "$SCHED_DIR/$id2/meta")" "tz_source=host" \
+  "with no --tz/config, the resolved zone is recorded as coming from the host" || fail=1
+
 # once → run self-disables the timer, and (regression for the meta-sourcing
 # bug) does not abort under set -e even with a spaced when_val/cwd.
 : > "$SYSTEMCTL_CALLS"; : > "$CLAUDE_CALLS"
@@ -57,6 +72,11 @@ assert_eq "$rc_once" "0" "once run does not abort under set -e (meta sourcing is
 assert_contains "$(cat "$CLAUDE_CALLS")" "--resume sid-1" "once run actually invokes claude" || fail=1
 assert_contains "$(cat "$CLAUDE_CALLS")" "cwd:$SCHED_PROJ_SPACED" "once run executes in the spaced cwd" || fail=1
 assert_contains "$(cat "$SYSTEMCTL_CALLS")" "disable --now claude-schedule-$id3.timer" "one-time run self-disables" || fail=1
+# `once` is the other frozen-contract kind (§3.1) — same fix as daily-at above:
+# no --tz still resolves and writes an explicit zone, never a bare datetime.
+assert_contains "$(cat "$SYSTEMD_USER_DIR/claude-schedule-$id3.timer")" "OnCalendar=2026-07-23 09:00:00 " \
+  "a once add with no --tz also writes an explicit zone (trailing space before the zone name proves something follows the bare digits)" || fail=1
+assert_contains "$(cat "$SCHED_DIR/$id3/meta")" "when_tz=" "once records the resolved zone in meta too" || fail=1
 unset SCHED_CWD
 
 # rm: removes units + metadata + disables

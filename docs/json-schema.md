@@ -271,11 +271,12 @@ empty list.
 | `account` | string | critical | |
 | `target` | `"chat"` \| `"new"` | critical | |
 | `sid` | string \| null | critical (when `target=="chat"`) | `null` for `target=="new"`. |
-| `whenKind` | `"every"` \| `"daily-at"` \| `"once"` | critical | |
-| `whenVal` | string | critical | |
-| `whenTz` | null | — | **honest unknown in this build**: always `null`. An unzoned wall-clock schedule is a defect, not a default — Task 12 fills this in and explains why. |
-| `tzSource` | `"none"` | — | always `"none"` in this build. |
-| `tzVerified` | `false` | — | always `false` in this build. |
+| `whenKind` | `"every"` \| `"daily-at"` \| `"once"` \| `"work-window"` | critical | |
+| `whenVal` | string | critical | `"HH:MM-HH:MM"` for `work-window`. |
+| `whenTz` | string \| null | critical | the IANA zone name (e.g. `Europe/Vilnius`) a wall-clock schedule is anchored to — never an offset. `null` for `whenKind=="every"` (a duration, not a calendar time) and for a legacy schedule written before this field existed (see `tzSource`/`tzNote`). |
+| `tzSource` | `"flag"` \| `"config"` \| `"host"` \| `"none"` | — | where the zone came from: an explicit `--tz`, `schedule_tz` in `config.conf`, the host's own zone as a last resort, or `"none"` for a legacy unzoned schedule (`whenKind=="every"` also reports `"none"`, since it has no zone to source). |
+| `tzNote` | string \| null | — | set only when `tzSource=="none"` **and** `whenKind` is a wall-clock kind: names the host zone the schedule is actually interpreted in, so a legacy schedule's real behavior is never left to guesswork. `null` otherwise. |
+| `tzVerified` | boolean | — | `true` when the exact stored calendar string was round-tripped through `systemd-analyze calendar` and its `Normalized:` line contained the zone; `false` when only the tzdata floor check ran (no `systemd-analyze` on this host) or when there is no zone to verify. |
 | `pings` | null | — | how many times this schedule has actually fired; not tracked anywhere yet (systemd's own timer state has no counter, and computing one would mean a `journalctl` read this build does not do) — reported as an honest `null`, not guessed at. |
 | `keepalive` | boolean | informational | |
 | `mode` | string | informational | |
@@ -293,14 +294,15 @@ pass. In this build `drift` is always the explicit unknown:
 
 ```json
 "drift": { "state": "unknown",
-           "reason": "work-window schedules and quota anchors are not in this build yet",
+           "reason": "drift detection (actual ping activity vs. the intended schedule) and quota anchors are not in this build yet",
            "actualStart": null, "evidence": null }
 ```
 
-work-window schedules and quota anchors — the two things a real drift
-computation would compare against — do not exist yet; claiming
-`drift:{state:"none"}` here would be a check reported as a pass without
-ever having run. Task 14 replaces `reason` with the real computation.
+Drift computation itself — comparing actual ping activity against the intended
+schedule — and quota anchors do not exist yet (Task 12 added the `work-window`
+`whenKind` and its zone plumbing, but not this comparison); claiming
+`drift:{state:"none"}` here would be a check reported as a pass without ever
+having run. Task 14 replaces `reason` with the real computation.
 
 ## Performance
 

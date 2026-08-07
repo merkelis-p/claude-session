@@ -148,7 +148,7 @@ UI_STUB
   # $HOME_REAL/.local/share/claude-helpers — the latter breaks when $CS points
   # at a repo checkout or a location-independence copy outside $HOME.
   local _m
-  for _m in compat.sh titles.sh ledger.sh schedule.sh titleindex.sh json.sh plan.sh; do
+  for _m in compat.sh config.sh titles.sh ledger.sh schedule.sh titleindex.sh json.sh plan.sh; do
     [[ -n "$HELPERS_LIB_SRC" && -f "$HELPERS_LIB_SRC/$_m" ]] \
       && cp "$HELPERS_LIB_SRC/$_m" "$HOME/.local/share/claude-helpers/$_m"
   done

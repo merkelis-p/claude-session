@@ -118,6 +118,7 @@ fi
 set -euo pipefail
 
 . "$CLAUDE_HELPERS_LIB/compat.sh"
+. "$CLAUDE_HELPERS_LIB/config.sh"
 . "$CLAUDE_HELPERS_LIB/ui.sh"
 . "$CLAUDE_HELPERS_LIB/titles.sh"
 . "$CLAUDE_HELPERS_LIB/ledger.sh"
@@ -988,7 +989,13 @@ _doctor_warnings() {
   # Same direct-call reasoning as check (8) above.
   _doctor_upstream_fields
 
-  # _DOCTOR_ISSUES is now the ONE inventory every check (1)-(9) feeds — the
+  # (10) Unzoned wall-clock schedules (see _doctor_unzoned_schedules). Never
+  # rewrites anything on disk — migration is only ever `schedule retime`, an
+  # explicit plan/apply/ack mutation (decision #3). Same direct-call reasoning
+  # as checks (8)-(9): it calls _di_add itself.
+  _doctor_unzoned_schedules
+
+  # _DOCTOR_ISSUES is now the ONE inventory every check (1)-(10) feeds — the
   # human "N issue(s) flagged" line (cmd_doctor), the plain-doctor exit
   # status (cmd_doctor), the `ls` warning count, and the JSON issues+processes
   # item counts (lib/json.sh) all derive from this SAME array, so they cannot
@@ -1062,6 +1069,61 @@ _doctor_upstream_fields() {
     _di_add "upstream-field" "warning" "" "" \
       "unknown session-state field '$k' (upstream schema changed — claude-session may be missing data)"
   done <<<"$keys"
+  return 0
+}
+
+# Unzoned wall-clock schedules, check (10) for _doctor_warnings above. An
+# OnCalendar with no zone is read in the SYSTEM zone (the shipped defect this
+# whole task fixes) — every schedule written before this fix, and any
+# hand-edited meta, carries no `when_tz`. This check ONLY reads meta files: it
+# never rewrites a unit (decision #3 — the only path to a fix is the explicit
+# `schedule retime <id> --tz=<Zone>` plan/apply/ack mutation, named in the
+# warning below so a user is never left knowing something is wrong with no
+# path to fix it).
+#
+# `when_kind=every` is a DURATION (OnActiveSec/OnUnitActiveSec), never a
+# wall-clock time, so it is skipped outright — flagging it would be a false
+# positive that trains a user to ignore this check.
+_doctor_unzoned_schedules() {
+  shopt -s nullglob
+  local sid_dir
+  local -a _dus_dirs=()
+  for sid_dir in "$SCHED_DIR"/*/; do _dus_dirs+=("$sid_dir"); done
+  (( ${#_dus_dirs[@]} )) || return 0
+
+  # Resolved ONCE for the whole check, not per matched schedule: neither the
+  # host zone nor config.conf changes between iterations of this loop.
+  local host_tz; host_tz="$(_host_timezone)"
+  _cs_config_load
+  local cfgz="${CS_CONFIG_VALS[schedule_tz]:-}"
+
+  for sid_dir in "${_dus_dirs[@]}"; do
+    [[ -f "$sid_dir/meta" ]] || continue
+    local id; id="$(basename "$sid_dir")"
+    local when_kind="" when_val="" when_tz=""
+    # shellcheck disable=SC1091
+    . "$sid_dir/meta" 2>/dev/null || true
+    case "$when_kind" in
+      daily-at|once|work-window) ;;
+      *) continue ;;
+    esac
+    [[ -n "$when_tz" ]] && continue
+
+    local local_eq="unknown"
+    if [[ -n "$cfgz" ]]; then
+      local hv="$when_val"
+      case "$when_kind" in work-window) hv="${when_val%-*}" ;; once) hv="${when_val#* }" ;; esac
+      local ep; ep="$(_sched_local_epoch "$host_tz" "$hv" 2>/dev/null)" || ep=""
+      [[ -n "$ep" ]] && local_eq="$(TZ="$cfgz" _epoch_to_human "$ep" '+%H:%M' 2>/dev/null || echo unknown)"
+    fi
+
+    printf "%b schedule %s: wall-clock time %s has no timezone — it fires in this host's %s\n" \
+      "$GLYPH_ALERT" "$id" "$when_val" "$host_tz"
+    printf "    (that is %s where you are, if your zone is %s)\n" "$local_eq" "${cfgz:-unknown}"
+    printf "    fix without moving it: claude-session schedule retime %s --tz=<Zone>\n" "$id"
+    _di_add "unzoned-schedule" "warning" "" "$id" \
+      "schedule $id: wall-clock time $when_val has no timezone — it fires in this host's $host_tz (fix: claude-session schedule retime $id --tz=<Zone>)"
+  done
   return 0
 }
 
